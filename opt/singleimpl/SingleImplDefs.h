@@ -1,24 +1,26 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
 #include <memory>
-#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
+#include "CheckCastTransform.h"
+#include "ClassHierarchy.h"
 #include "DexClass.h"
-#include "DexOpcode.h"
+#include "IRInstruction.h"
+#include "IRList.h"
+#include "SingleImpl.h"
 
-#include <folly/dynamic.h>
+struct ProguardMap;
 
 /**
  * Analyze and optimize data structures.
@@ -27,19 +29,16 @@
 
 using Scope = std::vector<DexClass*>;
 
-using TypeSet = std::unordered_set<DexType*>;
 using TypeList = std::vector<DexType*>;
 using TypeMap = std::unordered_map<DexType*, DexType*>;
 using TypeToTypes = std::unordered_map<DexType*, TypeList>;
 using FieldList = std::vector<DexField*>;
-using MethodSet = std::unordered_set<DexMethod*>;
-using TypeOpcodeList = std::vector<DexOpcodeType*>;
-using MethodOpcodeList = std::vector<DexOpcodeMethod*>;
-using MethodOpcodeSet = std::unordered_set<DexOpcodeMethod*>;
-using FieldOpcodeList = std::vector<DexOpcodeField*>;
-using FieldRefToOpcodes = std::unordered_map<DexField*, FieldOpcodeList>;
-using MethodToOpcodes = std::unordered_map<DexMethod*, MethodOpcodeSet>;
-using NewMethods = std::unordered_map<DexMethod*, DexMethod*>;
+using OrderedMethodSet = std::set<DexMethod*, dexmethods_comparator>;
+using OpcodeList = std::vector<IRInstruction*>;
+using OpcodeSet = std::unordered_set<IRInstruction*>;
+using FieldRefToOpcodes = std::unordered_map<DexFieldRef*, OpcodeList>;
+using MethodToOpcodes = std::unordered_map<DexMethodRef*, OpcodeSet>;
+using NewMethods = std::unordered_map<DexMethodRef*, DexMethodRef*>;
 using NewVTable = std::vector<std::pair<DexMethod*, DexMethod*>>;
 
 /**
@@ -58,8 +57,6 @@ enum EscapeReason : uint32_t {
   HAS_ARRAY_TYPE = 0x4,
   // interface is in the signature of a native method
   NATIVE_METHOD = 0x8,
-  // interface appears in a const-cast instruction
-  CONST_CLASS = 0x10,
   // a method ref to the interface is for a method not defined on the interface
   UNKNOWN_MREF = 0x20,
   // a field ref whose class is the interface
@@ -68,12 +65,12 @@ enum EscapeReason : uint32_t {
   FILTERED = 0x80,
   // parent is unknown to redex
   IMPL_PARENT_ESCAPED = 0x100,
-  // method in interface refers to the interface itself
-  SELF_REFERENCE = 0X200,
+  // interface is reference as a return type of a method
+  HAS_RETURN_REF = 0x200,
   // interface marked DoNotStrip
   DO_NOT_STRIP = 0X400,
-  // create a reference from not-primary into primary
-  NOT_IN_PRIMARY = 0x800,
+  // create a reference across stores that is illegal
+  CROSS_STORES = 0x800,
   // optimization escape reason
   // interface substitution causes a collision with an existing method
   SIG_COLLISION = 0x10000,
@@ -117,15 +114,21 @@ struct SingleImplData {
   // single impl interface typed fields
   FieldList fielddefs;
   // methods with the single impl interface in the signature
-  MethodSet methoddefs;
+  OrderedMethodSet methoddefs;
   // single impl interface typerefs
-  TypeOpcodeList typerefs;
+  OpcodeList typerefs;
   // single impl interface typed fieldref opcode
   FieldRefToOpcodes fieldrefs;
   // invoke-interface to the single impl interface methods
   MethodToOpcodes intf_methodrefs;
   // opcodes to a methodref with the single impl interface in the signature
   MethodToOpcodes methodrefs;
+
+  std::unordered_map<DexMethod*,
+                     std::unordered_map<IRInstruction*, IRList::iterator>>
+      referencing_methods;
+
+  std::mutex mutex;
 
   bool is_escaped() const { return escape != NO_ESCAPE; }
 };
@@ -134,12 +137,18 @@ struct SingleImplData {
 using SingleImpls = std::unordered_map<DexType*, SingleImplData>;
 
 struct SingleImplAnalysis {
+  virtual ~SingleImplAnalysis() = default;
+
   /**
    * Create a SingleImplAnalysis from a given Scope.
    */
   static std::unique_ptr<SingleImplAnalysis> analyze(
-      const Scope& scope, DexClasses& primary_dex, const TypeMap& single_impl,
-      const TypeSet& intfs, const folly::dynamic& config);
+      const Scope& scope,
+      const DexStoresVector& stores,
+      const TypeMap& single_impl,
+      const TypeSet& intfs,
+      const ProguardMap& pg_map,
+      const SingleImplConfig& config);
 
   /**
    * Escape an interface and all parent interfaces.
@@ -176,7 +185,26 @@ struct SingleImplAnalysis {
   SingleImpls single_impls;
 };
 
+struct OptimizeStats {
+  size_t removed_interfaces{0};
+  size_t inserted_check_casts{0};
+  size_t retained_check_casts{0};
+  check_casts::impl::Stats post_process;
+  size_t deleted_removed_instructions{0};
+  OptimizeStats& operator+=(const OptimizeStats& rhs) {
+    removed_interfaces += rhs.removed_interfaces;
+    inserted_check_casts += rhs.inserted_check_casts;
+    retained_check_casts += rhs.retained_check_casts;
+    post_process += rhs.post_process;
+    deleted_removed_instructions += rhs.deleted_removed_instructions;
+    return *this;
+  }
+};
+
 /**
  * Run an optimization pass over a SingleImplAnalysis.
  */
-size_t optimize(std::unique_ptr<SingleImplAnalysis> analysis, Scope& scope);
+OptimizeStats optimize(std::unique_ptr<SingleImplAnalysis> analysis,
+                       const ClassHierarchy& ch,
+                       Scope& scope,
+                       const SingleImplConfig& config);

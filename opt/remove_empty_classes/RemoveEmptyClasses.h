@@ -1,19 +1,17 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
 
-#include "PassManager.h"
+#include "Pass.h"
 
 class RemoveEmptyClassesPass : public Pass {
  public:
   RemoveEmptyClassesPass() : Pass("RemoveEmptyClassesPass") {}
 
-  virtual void run_pass(DexClassesVector&, PgoFiles&) override;
+  void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
 };

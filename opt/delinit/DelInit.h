@@ -1,10 +1,8 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #pragma once
@@ -15,5 +13,11 @@ class DelInitPass : public Pass {
  public:
   DelInitPass() : Pass("DelInitPass") {}
 
-  virtual void run_pass(DexClassesVector&, PgoFiles&) override;
+  void bind_config() override {
+    bind("package_allowlist", {}, m_package_filter);
+  }
+  void run_pass(DexStoresVector&, ConfigFiles&, PassManager&) override;
+
+ private:
+  std::vector<std::string> m_package_filter;
 };

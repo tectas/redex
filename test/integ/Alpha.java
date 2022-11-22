@@ -1,10 +1,8 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 package com.facebook.redextest;
@@ -54,5 +52,50 @@ class Gamma extends java.io.FilterWriter {
     public java.io.Writer getWriter() {
       return out;
     }
+  }
+}
+
+/*
+The class SyntheticConstructor is added to test whether the const/4 insn
+before calling a synthetic constructor can be removed by LocalDcePass
+*/
+
+class SyntheticConstructor {
+  public SyntheticConstructor(int i) {
+    x = i;
+  }
+  private static int x;
+  private SyntheticConstructor() {
+    x = 1;
+  }
+  public class InnerClass {
+    private SyntheticConstructor sc;
+    public InnerClass() {
+      sc = new SyntheticConstructor();
+    }
+    public int getValue() {
+      return sc.x;
+    }
+  }
+}
+
+class Delta {
+  public void foo() {
+    Epsilon.wrapper();
+ }
+}
+
+class Epsilon {
+  public static void wrapper() {
+    try {
+      target();
+    } catch (Throwable t) {
+
+    }
+  }
+
+  public static void target() {
+    // some code...
+    java.lang.Integer.parseInt("CrashMe");
   }
 }

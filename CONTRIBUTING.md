@@ -3,6 +3,10 @@
 We want to make contributing to this project as easy and transparent as
 possible.
 
+## Code of Conduct
+
+The code of conduct is described in [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+
 ## Our Development Process
 
 This project is developed internally at Facebook inside a private repository.
@@ -42,10 +46,10 @@ Our only hard-and-fast coding style rules are:
 * 2 spaces for indentation rather than tabs
 * 80 character line length
 
-In general, if you use our .clang-format file in the root of this repo, no one
+In general, if you use our [.clang-format file](https://github.com/facebook/redex/blob/master/.clang-format), no one
 will complain.
 
 ## License
 
 By contributing to ReDex, you agree that your contributions will be licensed
-under its BSD license.
+under its MIT license.

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <color name="bg_grey">#ECF3FF</color>
+  <color name="keep_me_unused_color">#009900</color>
+  <color name="prickly_green">#8A9E46</color>
+  <color name="hex_or_file">#000000</color>
+  <color name="duplicate_name">#000001</color>
+</resources>

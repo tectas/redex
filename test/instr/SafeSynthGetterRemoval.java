@@ -1,10 +1,8 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 package com.facebook.redex.test.instr;
@@ -81,23 +79,23 @@ public class SafeSynthGetterRemoval {
     @Test
     public void test() {
 
-	// First test that the Alpha and Alpha.Beta classes work.
-        Alpha a = new Alpha(12);
-        Alpha.Beta b = a.new Beta();
-        assertThat(b.doublex()).isEqualTo(24);
+      // First test that the Alpha and Alpha.Beta classes work.
+      Alpha a = new Alpha(12);
+      Alpha.Beta b = a.new Beta();
+      assertThat(b.doublex()).isEqualTo(24);
 
-        // Now test the Gamma and Gamma.Delta classes.
-        String s = "";
-        String expected = "hello";
-        try {
-      		java.io.Writer writer = new java.io.StringWriter();
-      		writer.write(expected);
-      		Gamma g = new Gamma(writer);
-      		Gamma.Delta d = g.new Delta();
-      		s = d.getWriter().toString();
-        } catch (java.io.IOException e) {
-      		s = e.toString();
-        }
-        assertThat(s).isEqualTo(expected);
+      // Now test the Gamma and Gamma.Delta classes.
+      String s = "";
+      String expected = "hello";
+      try {
+      	java.io.Writer writer = new java.io.StringWriter();
+      	writer.write(expected);
+      	Gamma g = new Gamma(writer);
+      	Gamma.Delta d = g.new Delta();
+      	s = d.getWriter().toString();
+      } catch (java.io.IOException e) {
+      	s = e.toString();
+      }
+      assertThat(s).isEqualTo(expected);
     }
 }

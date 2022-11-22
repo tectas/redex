@@ -1,10 +1,8 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include <cstdint>
@@ -23,6 +21,7 @@ TEST(EvArgTest, empty) {
     EXPECT_EQ(read_evarg(bufp, len, true), uint64_t(exps));  \
   } while (0)
 
+  EVTEST(0xff37, 0xffffffffffffff37, 1, 0x37, 0xff);
   EVTEST(0xc150af7e, 0xffffffffc150af7e, 3, 0x7e, 0xaf, 0x50, 0xc1);
   EVTEST(0x00, 0x00, 0, 0x00);
   EVTEST(0x40, 0x40, 0, 0x40);

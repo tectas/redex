@@ -1,18 +1,21 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
+#include "DexDebugInstruction.h"
+#include "DexEncoding.h"
 #include "Formatters.h"
 #include "PrintUtil.h"
-#include <RedexDump.h>
+#include "RedexDump.h"
+#include "utils/Unicode.h"
+
 #include <sstream>
 #include <string.h>
 #include <string>
+#include <vector>
 
 /**
  * Return a proto string in the form
@@ -21,7 +24,7 @@
 static std::string get_proto(ddump_data* rd,
                              uint32_t idx,
                              bool with_shorty = true) {
-  std::stringstream ss;
+  std::ostringstream ss;
   dex_proto_id* proto = rd->dex_proto_ids + idx;
   if (with_shorty) {
     ss << dex_string_by_idx(rd, proto->shortyidx) << " ";
@@ -45,7 +48,7 @@ static std::string get_proto(ddump_data* rd,
  * class field_type field_name
  */
 static std::string get_field(ddump_data* rd, uint32_t idx) {
-  std::stringstream ss;
+  std::ostringstream ss;
   dex_field_id* field = rd->dex_field_ids + idx;
   ss << dex_string_by_type_idx(rd, field->classidx) << " "
      << dex_string_by_type_idx(rd, field->typeidx) << " "
@@ -58,7 +61,7 @@ static std::string get_field(ddump_data* rd, uint32_t idx) {
  * class method_proto_no_shorty method_name
  */
 static std::string get_method(ddump_data* rd, uint32_t idx) {
-  std::stringstream ss;
+  std::ostringstream ss;
   dex_method_id* method = rd->dex_method_ids + idx;
   ss << dex_string_by_type_idx(rd, method->classidx) << " "
      << dex_string_by_idx(rd, method->nameidx) << " "
@@ -72,7 +75,7 @@ static std::string get_method(ddump_data* rd, uint32_t idx) {
 static std::string get_flags(uint32_t flags,
                              bool cls = true,
                              bool method = false) {
-  std::stringstream ss;
+  std::ostringstream ss;
   if (flags & DexAccessFlags::ACC_PUBLIC) {
     ss << "public ";
   }
@@ -123,7 +126,7 @@ static std::string get_flags(uint32_t flags,
 static std::string get_class_def(ddump_data* rd,
                                  uint32_t idx,
                                  bool metadata = true) {
-  std::stringstream ss;
+  std::ostringstream ss;
   dex_class_def* cls_def = rd->dex_class_defs + idx;
   ss << get_flags(cls_def->access_flags)
      << dex_string_by_type_idx(rd, cls_def->typeidx);
@@ -177,7 +180,7 @@ static std::string get_class_def(ddump_data* rd,
  * ...
  */
 static std::string get_class_data_item(ddump_data* rd, uint32_t idx) {
-  std::stringstream ss;
+  std::ostringstream ss;
   const dex_class_def* class_defs =
       (dex_class_def*)(rd->dexmmap + rd->dexh->class_defs_off) + idx;
   auto cls_off = class_defs->class_data_offset;
@@ -228,13 +231,13 @@ static std::string get_class_data_item(ddump_data* rd, uint32_t idx) {
 
 static std::string get_code_item(dex_code_item** pcode_item) {
   dex_code_item* code_item = *pcode_item;
-  std::stringstream ss;
+  std::ostringstream ss;
   ss << "registers_size: " << code_item->registers_size << ", "
      << "ins_size: " << code_item->ins_size << ", "
      << "outs_size: " << code_item->outs_size << ", "
      << "tries_size: " << code_item->tries_size << ", "
-     << "debug_info_off: " << code_item->debug_info_off << ", "
-     << "insns_size: " << code_item->insns_size << "\n";
+     << "debug_info_off: 0x" << std::hex << code_item->debug_info_off << ", "
+     << "insns_size: " << std::dec << code_item->insns_size << "\n";
   const uint16_t* dexptr =
       (const uint16_t*)(code_item + 1) + code_item->insns_size;
   *pcode_item = (dex_code_item*)dexptr;
@@ -270,21 +273,232 @@ static std::string get_code_item(dex_code_item** pcode_item) {
   return ss.str();
 }
 
+class DexDebugInstructionReader {
+ protected:
+  virtual void handle_advance_pc(DexDebugItemOpcode op, uint32_t arg) {
+    return handle_default(op);
+  }
+  virtual void handle_advance_line(DexDebugItemOpcode op, int32_t arg) {
+    return handle_default(op);
+  }
+  virtual void handle_start_local(DexDebugItemOpcode op,
+                                  uint32_t arg1,
+                                  uint32_t arg2,
+                                  uint32_t arg3) {
+    return handle_default(op);
+  }
+  virtual void handle_start_local_extended(DexDebugItemOpcode op,
+                                           uint32_t arg1,
+                                           uint32_t arg2,
+                                           uint32_t arg3,
+                                           uint32_t arg4) {
+    return handle_default(op);
+  }
+  virtual void handle_end_local(DexDebugItemOpcode op, uint32_t arg1) {
+    return handle_default(op);
+  }
+  virtual void handle_restart_local(DexDebugItemOpcode op, uint32_t arg1) {
+    return handle_default(op);
+  }
+  virtual void handle_set_file(DexDebugItemOpcode op, uint32_t arg) {
+    return handle_default(op);
+  }
+  virtual void handle_set_prologue_end(DexDebugItemOpcode op) {
+    return handle_default(op);
+  }
+  virtual void handle_set_epilogue_begin(DexDebugItemOpcode op) {
+    return handle_default(op);
+  }
+  virtual void handle_default(DexDebugItemOpcode op) = 0;
+
+ public:
+  virtual ~DexDebugInstructionReader() {}
+
+  void read(const uint8_t*& data) {
+    uint32_t u1, u2, u3, u4;
+    int32_t s1;
+    while (true) {
+      DexDebugItemOpcode op = (DexDebugItemOpcode)*data++;
+      switch (op) {
+      case DBG_END_SEQUENCE:
+        return;
+      case DBG_ADVANCE_PC:
+        u1 = read_uleb128(&data);
+        handle_advance_pc(op, u1);
+        break;
+      case DBG_ADVANCE_LINE:
+        s1 = read_sleb128(&data);
+        handle_advance_line(op, s1);
+        break;
+      case DBG_START_LOCAL:
+        u1 = read_uleb128(&data);
+        u2 = read_uleb128(&data);
+        u3 = read_uleb128(&data);
+        handle_start_local(op, u1, u2, u3);
+        break;
+      case DBG_START_LOCAL_EXTENDED:
+        u1 = read_uleb128(&data);
+        u2 = read_uleb128(&data);
+        u3 = read_uleb128(&data);
+        u4 = read_uleb128(&data);
+        handle_start_local_extended(op, u1, u2, u3, u4);
+        break;
+      case DBG_END_LOCAL:
+        u1 = read_uleb128(&data);
+        handle_end_local(op, u1);
+        break;
+      case DBG_RESTART_LOCAL:
+        u1 = read_uleb128(&data);
+        handle_restart_local(op, u1);
+        break;
+      case DBG_SET_PROLOGUE_END:
+        handle_set_prologue_end(op);
+        break;
+      case DBG_SET_EPILOGUE_BEGIN:
+        handle_set_epilogue_begin(op);
+        break;
+      case DBG_SET_FILE:
+        u1 = read_uleb128(&data);
+        handle_set_file(op, u1);
+        break;
+      default: // special opcodes
+        handle_default(op);
+        break;
+      };
+    }
+  }
+};
+
+uint32_t count_debug_instructions(const uint8_t*& encdata) {
+  struct DexDebugInstructionCounter : public DexDebugInstructionReader {
+    int sum;
+    void handle_default(DexDebugItemOpcode op) override { sum++; }
+  };
+  auto counter = DexDebugInstructionCounter();
+  counter.read(encdata);
+  return counter.sum;
+}
+
+void disassemble_debug(ddump_data* rd, uint32_t offset) {
+  redump("Disassembling debug opcodes at 0x%x\n", offset);
+  auto data = (const uint8_t*)(rd->dexmmap + offset);
+  auto line_start = read_uleb128(&data);
+  auto parameters_size = read_uleb128(&data);
+  redump("line_start: %d, parameters_size: %d\n", line_start, parameters_size);
+  for (unsigned int i = 0; i < parameters_size; ++i) {
+    read_uleb128(&data);
+  }
+  struct DexDebugInstructionPrinter : public DexDebugInstructionReader {
+    void handle_advance_pc(DexDebugItemOpcode op, uint32_t arg) override {
+      redump("DBG_ADVANCE_PC %u\n", arg);
+    }
+    void handle_advance_line(DexDebugItemOpcode op, int32_t arg) override {
+      redump("DBG_ADVANCE_LINE %d\n", arg);
+    }
+    void handle_start_local(DexDebugItemOpcode op,
+                            uint32_t reg,
+                            uint32_t name_idx,
+                            uint32_t type_idx) override {
+      redump("DBG_START_LOCAL %d\n", reg);
+    }
+    void handle_start_local_extended(DexDebugItemOpcode op,
+                                     uint32_t reg,
+                                     uint32_t,
+                                     uint32_t,
+                                     uint32_t) override {
+      redump("DBG_START_LOCAL_EXTENDED %d\n", reg);
+    }
+    void handle_end_local(DexDebugItemOpcode op, uint32_t reg) override {
+      redump("DBG_END_LOCAL %d\n", reg);
+    }
+    void handle_restart_local(DexDebugItemOpcode op, uint32_t reg) override {
+      redump("DBG_RESTART_LOCAL %d\n", reg);
+    }
+    void handle_set_file(DexDebugItemOpcode op, uint32_t arg) override {
+      redump("DBG_SET_FILE\n");
+    }
+    void handle_set_prologue_end(DexDebugItemOpcode op) override {
+      redump("DBG_SET_PROLOGUE_END\n");
+    }
+    void handle_set_epilogue_begin(DexDebugItemOpcode op) override {
+      redump("DBG_SET_EPILOGUE_BEGIN\n");
+    }
+    void handle_default(DexDebugItemOpcode op) override {
+      redump("DBG_SPECIAL 0x%02x\n", (uint32_t)op);
+    }
+  };
+  DexDebugInstructionPrinter().read(data);
+}
+
+static std::string get_debug_item(const uint8_t** pdebug_item) {
+  auto line_start = read_uleb128(pdebug_item);
+  auto parameters_size = read_uleb128(pdebug_item);
+  for (unsigned int i = 0; i < parameters_size; ++i) {
+    read_uleb128(pdebug_item);
+  }
+  auto num_opcodes = count_debug_instructions(*pdebug_item);
+  std::ostringstream ss;
+  ss << "line_start: " << line_start << ", "
+     << "parameters_size: " << parameters_size << ", "
+     << "num_opcodes: " << num_opcodes << "\n";
+  return ss.str();
+}
+
 // Dump a string_data_item (i.e., an entry in the string data
-// section), advancing POS_INOUT over the item.  BUG: we dump the
-// MUTF8 string as if it were standard UTF8.  Shame on us.
+// section), advancing POS_INOUT over the item.
 static const char string_data_header[] = "u16len [contents]";
 static void dump_string_data_item(const uint8_t** pos_inout) {
   const uint8_t* pos = *pos_inout;
   uint32_t utf16_code_point_count = read_uleb128(&pos); // Not byte count!
-  size_t utf8_length = strlen((char*) pos);
-  redump("%03u [%s]\n", (unsigned) utf16_code_point_count, pos);
+  size_t utf8_length = strlen((char*)pos);
+  std::string cleansed_data;
+  const char* string_to_print;
+  if (raw) { // Output whatever bytes we have
+    string_to_print = (char*)pos;
+  } else if (escape) { // Escape non-printable characters.
+    cleansed_data.reserve(utf8_length); // Avoid some reallocation.
+    for (size_t i = 0; i < utf8_length; i++) {
+      if (isprint(pos[i])) {
+        cleansed_data.push_back(pos[i]);
+      } else {
+        char buf[5];
+        sprintf(buf, "\\x%02x", pos[i]);
+        cleansed_data.append(buf);
+      }
+    }
+    string_to_print = cleansed_data.c_str();
+  } else { // Translate to UTF-8; strip control characters
+    std::vector<char32_t> code_points;
+    const char* enc_pos = (char*)pos;
+    uint32_t cp;
+    while ((cp = mutf8_next_code_point(enc_pos))) {
+      if (cp < ' ' || cp == 255 /* DEL */) {
+        cp = '.';
+      }
+      code_points.push_back(cp);
+    }
+    ssize_t nr_utf8_bytes =
+        utf32_to_utf8_length(&code_points[0], code_points.size());
+    if (nr_utf8_bytes < 0 && utf8_length == 0) {
+      cleansed_data = "";
+    } else if (nr_utf8_bytes < 0) {
+      cleansed_data = "{invalid encoding?}";
+    } else {
+      cleansed_data.resize(nr_utf8_bytes + 1);
+      utf32_to_utf8(&code_points[0], code_points.size(), &cleansed_data[0],
+                    nr_utf8_bytes + 1);
+    }
+    string_to_print = cleansed_data.c_str();
+  }
+  redump("%03u [%s]\n", (unsigned)utf16_code_point_count, string_to_print);
   *pos_inout = pos + utf8_length + 1;
 }
 
-void dump_stringdata(ddump_data* rd) {
-  redump("\nRAW STRING DATA\n");
-  redump("%s\n", string_data_header);
+void dump_stringdata(ddump_data* rd, bool print_headers) {
+  if (print_headers) {
+    redump("\nRAW STRING DATA\n");
+    redump("%s\n", string_data_header);
+  }
   dex_map_item* string_data = get_dex_map_item(rd, TYPE_STRING_DATA_ITEM);
   if (string_data == nullptr) {
     redump("!!!! No string data section found\n");
@@ -295,8 +509,7 @@ void dump_stringdata(ddump_data* rd) {
   // in the string data section is a ULEB128 length followed by a
   // NUL-terminated modified-UTF-8 encoded string.
 
-  const uint8_t* str_data_ptr =
-    (uint8_t*) (rd->dexmmap) + string_data->offset;
+  const uint8_t* str_data_ptr = (uint8_t*)(rd->dexmmap) + string_data->offset;
   for (uint32_t i = 0; i < string_data->size; ++i) {
     dump_string_data_item(&str_data_ptr);
   }
@@ -306,12 +519,22 @@ void dump_stringdata(ddump_data* rd) {
 // Table dumpers...
 //
 
-void dump_strings(ddump_data* rd) {
+void dump_strings(ddump_data* rd, bool print_headers) {
   auto offset = rd->dexh->string_ids_off;
   const uint8_t* str_id_ptr = (uint8_t*)(rd->dexmmap) + offset;
   auto size = rd->dexh->string_ids_size;
-  redump("\nSTRING IDS TABLE: %d\n", size);
-  redump("%s\n", string_data_header);
+  auto length = 0;
+  uint32_t tmp_str_id_off = 0;
+  for (uint32_t i = 0; i < size; ++i) {
+    const uint8_t* str_data_ptr = (uint8_t*)(rd->dexmmap) + tmp_str_id_off;
+    length += strlen((char*)str_data_ptr);
+    tmp_str_id_off += 4;
+  }
+
+  if (print_headers) {
+    redump("\nSTRING IDS TABLE: %d %d\n", size, length);
+    redump("%s\n", string_data_header);
+  }
   for (uint32_t i = 0; i < size; ++i) {
     auto str_data_off = *(uint32_t*)str_id_ptr;
     str_id_ptr += 4;
@@ -336,55 +559,65 @@ void dump_types(ddump_data* rd) {
   }
 }
 
-void dump_protos(ddump_data* rd) {
+void dump_protos(ddump_data* rd, bool print_headers) {
   auto size = rd->dexh->proto_ids_size;
-  redump("\nPROTO IDS TABLE: %d\n", size);
-  redump("[proto_ids_off] shorty proto\n");
+  if (print_headers) {
+    redump("\nPROTO IDS TABLE: %d\n", size);
+    redump("[proto_ids_off] shorty proto\n");
+  }
   for (uint32_t i = 0; i < size; i++) {
     redump(i, "%s\n", get_proto(rd, i).c_str());
   }
 }
 
-void dump_fields(ddump_data* rd) {
+void dump_fields(ddump_data* rd, bool print_headers) {
   auto size = rd->dexh->field_ids_size;
-  redump("\nFIELD IDS TABLE: %d\n", size);
-  redump("[field_ids_off] class type name\n");
+  if (print_headers) {
+    redump("\nFIELD IDS TABLE: %d\n", size);
+    redump("[field_ids_off] class type name\n");
+  }
   for (uint32_t i = 0; i < size; i++) {
     redump(i, "%s\n", get_field(rd, i).c_str());
   }
 }
 
-void dump_methods(ddump_data* rd) {
+void dump_methods(ddump_data* rd, bool print_headers) {
   uint32_t size = rd->dexh->method_ids_size;
-  redump("\nMETHOD IDS TABLE: %d\n", size);
-  redump("[method_ids_off] class name proto_no_shorty\n");
+  if (print_headers) {
+    redump("\nMETHOD IDS TABLE: %d\n", size);
+    redump("[method_ids_off] class name proto_no_shorty\n");
+  }
   for (uint32_t i = 0; i < size; i++) {
     redump(i, "%s\n", get_method(rd, i).c_str());
   }
 }
 
-void dump_clsdefs(ddump_data* rd) {
+void dump_clsdefs(ddump_data* rd, bool print_headers) {
   auto size = rd->dexh->class_defs_size;
-  redump("\nCLASS DEFS TABLE: %d\n", size);
-  redump(
-      "[class_def_off] flags class 'extends' superclass"
-      "['implements' interfaces]\n"
-      "\t[file: <filename>] [anno: annotation_off] data: class_data_off "
-      "[static values: static_value_off]\n");
+  if (print_headers) {
+    redump("\nCLASS DEFS TABLE: %d\n", size);
+    redump(
+        "[class_def_off] flags class 'extends' superclass"
+        "['implements' interfaces]\n"
+        "\t[file: <filename>] [anno: annotation_off] data: class_data_off "
+        "[static values: static_value_off]\n");
+  }
   for (uint32_t i = 0; i < size; i++) {
     redump(i, "%s\n", get_class_def(rd, i).c_str());
   }
 }
 
-void dump_clsdata(ddump_data* rd) {
+void dump_clsdata(ddump_data* rd, bool print_headers) {
   auto size = rd->dexh->class_defs_size;
-  redump("\nCLASS DATA TABLE: %d\n", size);
-  redump(
-      "[cls_data_off] class\n"
-      "sfields: <count> followed by sfields\n"
-      "ifields: <count> followed by ifields\n"
-      "dmethods: <count> followed by dmethods\n"
-      "vmethods: <count> followed by vmethods\n");
+  if (print_headers) {
+    redump("\nCLASS DATA TABLE: %d\n", size);
+    redump(
+        "[cls_data_off] class\n"
+        "sfields: <count> followed by sfields\n"
+        "ifields: <count> followed by ifields\n"
+        "dmethods: <count> followed by dmethods\n"
+        "vmethods: <count> followed by vmethods\n");
+  }
   for (uint32_t i = 0; i < size; i++) {
     const dex_class_def* class_defs =
         (dex_class_def*)(rd->dexmmap + rd->dexh->class_defs_off) + i;
@@ -394,12 +627,73 @@ void dump_clsdata(ddump_data* rd) {
   }
 }
 
+void dump_callsites(ddump_data* rd, bool print_headers) {
+  auto map = rd->dexmmap + rd->dexh->map_off;
+  const dex_map_list* map_list = reinterpret_cast<const dex_map_list*>(map);
+  const dex_callsite_id* callsites = nullptr;
+  int count = 0;
+  for (uint32_t i = 0; i < map_list->size; i++) {
+    const auto& item = map_list->items[i];
+    if (item.type == TYPE_CALL_SITE_ID_ITEM) {
+      count = item.size;
+      callsites = reinterpret_cast<dex_callsite_id*>(rd->dexmmap + item.offset);
+    }
+  }
+
+  // TODO(T58569493) - emit full call site info
+  if (print_headers) {
+    redump("\nCALL SITE TABLE: %d\n", count);
+    for (int i = 0; i < count; ++i) {
+      const uint8_t* ptr =
+          reinterpret_cast<uint8_t*>(rd->dexmmap + callsites[i].callsite_off);
+      redump("[%0x] offset:0x%0x %s\n", i, callsites[i].callsite_off,
+             format_callsite(rd, &ptr).c_str());
+    }
+  }
+}
+
+void dump_methodhandles(ddump_data* rd, bool print_headers) {
+  auto map = rd->dexmmap + rd->dexh->map_off;
+  const dex_map_list* map_list = reinterpret_cast<const dex_map_list*>(map);
+  const dex_methodhandle_id* methodhandles = nullptr;
+  int count = 0;
+  for (uint32_t i = 0; i < map_list->size; i++) {
+    const auto& item = map_list->items[i];
+    if (item.type == TYPE_METHOD_HANDLE_ITEM) {
+      count = item.size;
+      methodhandles =
+          reinterpret_cast<dex_methodhandle_id*>(rd->dexmmap + item.offset);
+    }
+  }
+
+  // TODO(T58569493) - emit full method handle info
+  if (print_headers) {
+    redump("\nMETHOD HANDLE TABLE: %d\n", count);
+    for (int i = 0; i < count; ++i) {
+      redump("[0x%x] field_or_method_id:0x%x type:%s\n", i,
+             methodhandles[i].field_or_method_id,
+             format_method_handle_type(
+                 (MethodHandleType)methodhandles[i].method_handle_type)
+                 .c_str());
+    }
+  }
+}
+
 static void dump_code_items(ddump_data* rd,
                             dex_code_item* code_items,
                             uint32_t size) {
   for (uint32_t i = 0; i < size; i++) {
     auto offset = reinterpret_cast<char*>(code_items) - rd->dexmmap;
     redump(offset, "%s", get_code_item(&code_items).c_str());
+  }
+}
+
+static void dump_debug_items(ddump_data* rd,
+                             const uint8_t* debug_items,
+                             uint32_t size) {
+  for (uint32_t i = 0; i < size; i++) {
+    auto offset = reinterpret_cast<const char*>(debug_items) - rd->dexmmap;
+    redump(offset, "%s", get_debug_item(&debug_items).c_str());
   }
 }
 
@@ -414,7 +708,7 @@ void dump_code(ddump_data* rd) {
       "ins_size: <count>,"
       "outs_size: <count>,"
       "tries_size: <count>,"
-      "debug_info_off: <count>,"
+      "debug_info_off: <addr>,"
       "insns_size: <count>\n");
   for (unsigned i = 0; i < count; i++) {
     if (maps[i].type == TYPE_CODE_ITEM) {
@@ -479,8 +773,8 @@ static void dump_class_annotations(ddump_data* rd, dex_class_def* df) {
           dex_string_by_type_idx(rd, rd->dex_method_ids[midx].classidx);
       const char* mname =
           dex_string_by_idx(rd, rd->dex_method_ids[midx].nameidx);
-      redump(
-          "    Method '%s', Type '%s' Parameter Annotations:\n", mtype, mname);
+      redump("    Method '%s', Type '%s' Parameter Annotations:\n", mtype,
+             mname);
       int param = 0;
       while (asrefsize--) {
         uint32_t aoff = *asref++;
@@ -497,6 +791,19 @@ void dump_anno(ddump_data* rd) {
   }
 }
 
+void dump_debug(ddump_data* rd) {
+  unsigned count;
+  dex_map_item* maps;
+  get_dex_map_items(rd, &count, &maps);
+  for (unsigned i = 0; i < count; i++) {
+    if (maps[i].type == TYPE_DEBUG_INFO_ITEM) {
+      auto debug_items = (uint8_t*)(rd->dexmmap + maps[i].offset);
+      dump_debug_items(rd, debug_items, maps[i].size);
+      return;
+    }
+  }
+}
+
 void dump_enarr(ddump_data* rd) {
   unsigned count;
   dex_map_item* maps;
@@ -505,6 +812,7 @@ void dump_enarr(ddump_data* rd) {
     if (maps[i].type == TYPE_ENCODED_ARRAY_ITEM) {
       auto ptr = (const uint8_t*)(rd->dexmmap + maps[i].offset);
       for (unsigned j = 0; j < maps[i].size; j++) {
+        redump((uint32_t)(ptr - (const uint8_t*)rd->dexmmap), ": ");
         uint32_t earray_size = read_uleb128(&ptr);
         for (uint32_t k = 0; k < earray_size; k++) {
           redump("%s", format_encoded_value(rd, &ptr).c_str());

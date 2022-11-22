@@ -1,4 +1,9 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
 #include "Resolver.h"
 #include "DexUtil.h"
@@ -11,58 +16,62 @@ inline bool match(const DexString* name,
   return name == cls_meth->get_name() && proto == cls_meth->get_proto();
 }
 
-DexMethod* check_vmethods(const DexString* name,
-                          const DexProto* proto,
-                          const DexType* type) {
-  const auto cls = type_class(type);
-  for (auto& method : cls->get_vmethods()) {
-    if (match(name, proto, method)) return method;
-  }
-  return nullptr;
-}
-
-DexMethod* check_dmethods(const DexString* name,
-                          const DexProto* proto,
-                          const DexType* type) {
-  const auto cls = type_class(type);
-  for (auto& method : cls->get_dmethods()) {
-    if (match(name, proto, method)) return method;
-  }
-  return nullptr;
-}
-
-DexMethod* resolve_intf_methodref(DexType* intf, DexMethod* meth) {
+DexMethod* resolve_intf_method_ref(const DexClass* cls,
+                                   const DexString* name,
+                                   const DexProto* proto) {
 
   auto find_method = [&](const DexClass* cls) -> DexMethod* {
-    always_assert(cls->get_access() & ACC_INTERFACE);
     const auto& vmethods = cls->get_vmethods();
     for (const auto vmethod : vmethods) {
-      if (vmethod->get_name() == meth->get_name() &&
-          vmethod->get_proto() == meth->get_proto()) {
+      if (vmethod->get_name() == name && vmethod->get_proto() == proto) {
         return vmethod;
       }
     }
     return nullptr;
   };
 
-  const auto intf_cls = type_class(intf);
-  if (intf_cls == nullptr) return nullptr;
-  auto method = find_method(intf_cls);
+  auto method = find_method(cls);
   if (method) return method;
-  const auto& super_intfs = intf_cls->get_interfaces()->get_type_list();
-  for (auto super_intf : super_intfs) {
-    method = resolve_intf_methodref(super_intf, meth);
+  for (const auto& super_intf : *cls->get_interfaces()) {
+    const auto& super_intf_cls = type_class(super_intf);
+    if (super_intf_cls == nullptr) continue;
+    method = resolve_intf_method_ref(super_intf_cls, name, proto);
     if (method) return method;
   }
   return nullptr;
 }
 
-}
+} // namespace
 
-DexMethod* resolve_method(
-    const DexClass* cls, const DexString* name,
-    const DexProto* proto, MethodSearch search) {
+DexMethod* resolve_method(const DexClass* cls,
+                          const DexString* name,
+                          const DexProto* proto,
+                          MethodSearch search,
+                          const DexMethod* caller) {
+  if (search == MethodSearch::Interface) {
+    return resolve_intf_method_ref(cls, name, proto);
+  }
+  if (search == MethodSearch::Super) {
+    if (caller) {
+      // caller must be provided. This condition is here to be compatible with
+      // old behavior.
+      DexType* containing_type = caller->get_class();
+      DexClass* containing_class = type_class(containing_type);
+      if (containing_class == nullptr) return nullptr;
+      DexType* super_class = containing_class->get_super_class();
+      if (!super_class) return nullptr;
+      cls = type_class(super_class);
+    }
+    // The rest is the same as virtual.
+    search = MethodSearch::Virtual;
+  }
   while (cls) {
+    if (search == MethodSearch::InterfaceVirtual) {
+      auto try_intf = resolve_intf_method_ref(cls, name, proto);
+      if (try_intf) {
+        return try_intf;
+      }
+    }
     if (search == MethodSearch::Virtual || search == MethodSearch::Any) {
       for (auto& vmeth : cls->get_vmethods()) {
         if (match(name, proto, vmeth)) {
@@ -70,8 +79,8 @@ DexMethod* resolve_method(
         }
       }
     }
-    if (search == MethodSearch::Direct || search == MethodSearch::Static
-        || search == MethodSearch::Any) {
+    if (search == MethodSearch::Direct || search == MethodSearch::Static ||
+        search == MethodSearch::Any) {
       for (auto& dmeth : cls->get_dmethods()) {
         if (match(name, proto, dmeth)) {
           return dmeth;
@@ -80,74 +89,43 @@ DexMethod* resolve_method(
     }
     // direct methods only look up the given class
     cls = search != MethodSearch::Direct ? type_class(cls->get_super_class())
-        : nullptr;
+                                         : nullptr;
   }
   return nullptr;
 }
 
-DexMethod* find_top_impl(
-    const DexClass* cls, const DexString* name, const DexProto* proto) {
-  DexMethod* top_impl = nullptr;
-  while (cls) {
-    for (const auto& vmeth : cls->get_vmethods()) {
-      if (match(name, proto, vmeth)) {
-        top_impl = vmeth;
-      }
+DexMethod* resolve_method_ref(const DexClass* cls,
+                              const DexString* name,
+                              const DexProto* proto,
+                              MethodSearch search) {
+  always_assert(search != MethodSearch::Super);
+  if (search != MethodSearch::Interface) {
+    const auto& super = cls->get_super_class();
+    if (super == nullptr) return nullptr;
+    const auto& super_cls = type_class(super);
+    auto resolved = resolve_method(super_cls, name, proto, search);
+    if (resolved || search != MethodSearch::InterfaceVirtual) {
+      return resolved;
     }
-    cls = type_class_internal(cls->get_super_class());
   }
-  return top_impl;
-}
-
-DexMethod* find_collision_excepting(const DexMethod* except,
-                                    const DexString* name,
-                                    const DexProto* proto,
-                                    const DexClass* cls,
-                                    bool is_virtual,
-                                    bool check_direct) {
-  for (auto& method : cls->get_dmethods()) {
-    if (match(name, proto, method) && method != except) return method;
-  }
-  for (auto& method : cls->get_vmethods()) {
-    if (match(name, proto, method) && method != except) return method;
-  }
-  if (!is_virtual) return nullptr;
-
-  auto super = type_class(cls->get_super_class());
-  if (super) {
-    auto method = resolve_virtual(super, name, proto);
-    if (method && method != except) return method;
-  }
-
-  TypeVector children;
-  get_all_children(cls->get_type(), children);
-  for (const auto& child : children) {
-    auto vmethod = check_vmethods(name, proto, child);
-    if (vmethod && vmethod != except) return vmethod;
-    if (check_direct) {
-      auto dmethod = check_dmethods(name, proto, child);
-      if (dmethod && dmethod != except) return dmethod;
-    }
+  for (const auto& super_intf : *cls->get_interfaces()) {
+    const auto& super_intf_cls = type_class(super_intf);
+    if (super_intf_cls == nullptr) continue;
+    auto method = resolve_intf_method_ref(super_intf_cls, name, proto);
+    if (method) return method;
   }
   return nullptr;
 }
 
-DexMethod* resolve_intf_methodref(DexMethod* meth) {
-  auto method = resolve_intf_methodref(meth->get_class(), meth);
-  return method;
-}
+DexField* resolve_field(const DexType* owner,
+                        const DexString* name,
+                        const DexType* type,
+                        FieldSearch fs) {
+  auto field_eq = [&](const DexField* a) {
+    return a->get_name() == name && a->get_type() == type;
+  };
 
-DexField* resolve_field(
-    const DexType* owner,
-    const DexString* name,
-    const DexType* type,
-    FieldSearch fs) {
-  auto field_eq =
-      [&](const DexField* a) {
-        return a->get_name() == name && a->get_type() == type;
-      };
-
-  auto cls = type_class_internal(owner);
+  const DexClass* cls = type_class(owner);
   while (cls) {
     if (fs == FieldSearch::Instance || fs == FieldSearch::Any) {
       for (auto ifield : cls->get_ifields()) {
@@ -162,9 +140,41 @@ DexField* resolve_field(
           return sfield;
         }
       }
+      // static final fields may be coming from interfaces so we
+      // have to walk up the interface hierarchy too
+      for (const auto& intf : *cls->get_interfaces()) {
+        auto field = resolve_field(intf, name, type, fs);
+        if (field != nullptr) return field;
+      }
     }
-    cls = type_class_internal(cls->get_super_class());
+    cls = type_class(cls->get_super_class());
   }
   return nullptr;
 }
 
+DexMethod* find_top_impl(const DexClass* cls,
+                         const DexString* name,
+                         const DexProto* proto) {
+  DexMethod* top_impl = nullptr;
+  while (cls) {
+    for (const auto& vmeth : cls->get_vmethods()) {
+      if (match(name, proto, vmeth)) {
+        top_impl = vmeth;
+      }
+    }
+    cls = type_class(cls->get_super_class());
+  }
+  return top_impl;
+}
+
+DexMethod* find_top_intf_impl(const DexClass* cls,
+                              const DexString* name,
+                              const DexProto* proto) {
+  DexMethod* top_impl = nullptr;
+  while (cls) {
+    DexMethod* top_mir_impl = resolve_intf_method_ref(cls, name, proto);
+    if (top_mir_impl != nullptr) top_impl = top_mir_impl;
+    cls = type_class(cls->get_super_class());
+  }
+  return top_impl;
+}

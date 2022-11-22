@@ -1,19 +1,14 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-#include <string>
 #include <gtest/gtest.h>
+#include <string>
 
 #include "RedexResources.h"
-
-std::unordered_set<std::string> extract_classes_from_native_lib(
-    const std::string& lib_contents);
 
 TEST(ExtractNativeTest, empty) {
   std::string over(700, 'L');

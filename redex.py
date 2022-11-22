@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+# pyre-strict
 
 import argparse
-import atexit
-import distutils.version
-import functools
+import errno
 import glob
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -15,765 +20,1302 @@ import subprocess
 import sys
 import tempfile
 import timeit
+import typing
 import zipfile
+from os.path import abspath, dirname, getsize, isdir, isfile, join
+from pipes import quote
 
-from os.path import abspath, basename, dirname, getsize, isdir, isfile, join, \
-        realpath, split
-
-timer = timeit.default_timer
-uncompressed_extensions = \
-        set(['.ogg', '.m4a', '.jpg', '.png', '.arsc', '.xzs'])
-
-
-def want_trace():
-    try:
-        trace = os.environ['TRACE']
-    except KeyError:
-        return False
-    for t in trace.split(','):
-        try:
-            return int(t) > 0
-        except ValueError:
-            pass
-        try:
-            (module, level) = t.split(':')
-            if module == 'REDEX' and int(level) > 0:
-                return True
-        except ValueError:
-            pass
-    return False
-
-
-def log(*stuff):
-    if want_trace():
-        print(*stuff, file=sys.stderr)
+import pyredex.bintools as bintools
+import pyredex.logger as logger
+from pyredex.buck import BuckConnectionScope, BuckPartScope
+from pyredex.unpacker import (
+    LibraryManager,
+    unpack_tar_xz,
+    UnpackManager,
+    ZipManager,
+    ZipReset,
+)
+from pyredex.utils import (
+    add_android_sdk_path,
+    argparse_yes_no_flag,
+    dex_glob,
+    find_android_build_tool,
+    get_android_sdk_path,
+    get_file_ext,
+    make_temp_dir,
+    move_dexen_to_directories,
+    remove_comments,
+    sign_apk,
+    with_temp_cleanup,
+)
 
 
-def find_android_build_tools():
-    VERSION_REGEXP = '\d+\.\d+(\.\d+)?'
-    android_home = os.environ['ANDROID_SDK']
-    build_tools = join(android_home, 'build-tools')
-    version = max(
-        (d for d in os.listdir(build_tools) if re.match(VERSION_REGEXP, d)),
-        key=distutils.version.StrictVersion
-    )
-    return join(build_tools, version)
+IS_WINDOWS: bool = os.name == "nt"
 
 
-def pgize(name):
+timer: typing.Callable[[], float] = timeit.default_timer
+
+
+# Pyre helper.
+T = typing.TypeVar("T")
+
+
+def _assert_val(input: typing.Optional[T]) -> T:
+    assert input is not None
+    return input
+
+
+def pgize(name: str) -> str:
     return name.strip()[1:][:-1].replace("/", ".")
 
 
-def run_pass(
-        executable_path,
-        script_args,
-        config_path,
-        config_json,
-        apk_dir,
-        dex_dir,
-        dexfiles,
-        ):
+def dbg_prefix(dbg: str, src_root: typing.Optional[str] = None) -> typing.List[str]:
+    """Return a debugger command prefix.
 
-    log('Running redex binary at ' + executable_path)
+    `dbg` is either "gdb" or "lldb", indicating which debugger to invoke.
+    `src_root` is an optional parameter that indicates the root directory that
+        all references to source files in debug information is relative to.
 
-    args = [executable_path] + [
-        '--apkdir', apk_dir,
-        '--outdir', dex_dir]
-    if config_path:
-        args += ['--config', config_path]
-    if script_args.warn:
-        args += ['--warn', script_args.warn]
-    if script_args.jarpath:
-        args += ['--jarpath', script_args.jarpath]
-    if script_args.proguard_config:
-        args += ['--proguard-config', script_args.proguard_config]
-    if script_args.keep:
-        args += ['--seeds', script_args.keep]
-    if script_args.proguard_map:
-        args += ['-Sproguard_map=' + script_args.proguard_map]
+    Returns a list of strings, which when prefixed onto a shell command
+        invocation will run that shell command under the debugger.
+    """
+    assert dbg in ["gdb", "lldb"]
 
-    args += ['-S' + x for x in script_args.passthru]
-    args += ['-J' + x for x in script_args.passthru_json]
+    cmd = [dbg]
+    if src_root is not None:
+        if dbg == "gdb":
+            cmd += ["-ex", quote("directory %s" % src_root)]
+        elif dbg == "lldb":
+            cmd += ["-o", f"""'settings set target.source-map "." {quote(src_root)}'"""]
 
-    args += dexfiles
+            # This makes assumptions about buck-out... I couldn't find an easy
+            # way to just get the config file beside this script...
+            dir_name = dirname(abspath(__file__))
+            dir_name = dirname(dir_name)
+            lldbinit_file = dir_name + "/.lldbinit/.lldbinit"
+            if isfile(lldbinit_file):
+                cmd += ["-o", f"'command source {quote(lldbinit_file)}'"]
 
+    DBG_END = {"gdb": "--args", "lldb": "--"}
+    cmd.append(DBG_END[dbg])
+
+    return cmd
+
+
+def write_debugger_command(
+    dbg: str, src_root: typing.Optional[str], args: typing.Iterable[str]
+) -> str:
+    """Write out a shell script that allows us to rerun redex-all under a debugger.
+
+    The choice of debugger is governed by `dbg` which can be either "gdb" or "lldb".
+    """
+    assert not IS_WINDOWS  # It's a Linux/Mac script...
+    fd, script_name = tempfile.mkstemp(suffix=".sh", prefix="redex-{}-".format(dbg))
+
+    # Parametrise redex binary.
+    args = [quote(a) for a in args]
+    redex_binary = args[0]
+    args[0] = '"$REDEX_BINARY"'
+
+    with os.fdopen(fd, "w") as f:
+        f.write("#! /usr/bin/env bash\n")
+        f.write('REDEX_BINARY="${REDEX_BINARY:-%s}"\n' % redex_binary)
+        f.write("cd %s || exit\n" % quote(os.getcwd()))
+        f.write(" ".join(dbg_prefix(dbg, src_root)))
+        f.write(" ")
+        f.write(" ".join(args))
+        if not IS_WINDOWS:
+            os.fchmod(fd, 0o775)  # This is unsupported on windows.
+
+    return script_name
+
+
+def add_extra_environment_args(env: typing.Dict[str, str]) -> None:
+    # If we haven't set MALLOC_CONF but we have requested to profile the memory
+    # of a specific pass, set some reasonable defaults
+    if "MALLOC_PROFILE_PASS" in env and "MALLOC_CONF" not in env:
+        env[
+            "MALLOC_CONF"
+        ] = "prof:true,prof_prefix:jeprof.out,prof_gdump:true,prof_active:false"
+
+    # If we haven't set MALLOC_CONF, tune MALLOC_CONF for better perf
+    if "MALLOC_CONF" not in env:
+        env["MALLOC_CONF"] = "background_thread:true,metadata_thp:always,thp:always"
+
+
+def get_stop_pass_idx(passes_list: typing.Iterable[str], pass_name_and_num: str) -> int:
+    # Get the stop position
+    # pass_name_and num may be "MyPass#0", "MyPass#3" or "MyPass"
+    pass_name = pass_name_and_num
+    pass_order = 0
+    if "#" in pass_name_and_num:
+        pass_name, pass_order = pass_name_and_num.split("#", 1)
+        try:
+            pass_order = int(pass_order)
+        except ValueError:
+            sys.exit(
+                "Invalid stop-pass %s, should be in 'SomePass(#num)'"
+                % pass_name_and_num
+            )
+    cur_order = 0
+    for _idx, _name in enumerate(passes_list):
+        if _name == pass_name:
+            if cur_order == pass_order:
+                return _idx
+            else:
+                cur_order += 1
+    sys.exit(
+        "Invalid stop-pass %s. %d %s in passes_list"
+        % (pass_name_and_num, cur_order, pass_name)
+    )
+
+
+class ExceptionMessageFormatter:
+    def format_rerun_message(self, gdb_script_name: str, lldb_script_name: str) -> str:
+        return "You can re-run it under gdb by running {} or under lldb by running {}".format(
+            gdb_script_name, lldb_script_name
+        )
+
+    def format_message(
+        self,
+        err_out: typing.List[str],
+        default_error_msg: str,
+        gdb_script_name: str,
+        lldb_script_name: str,
+    ) -> str:
+        return "{} {}".format(
+            default_error_msg,
+            self.format_rerun_message(gdb_script_name, lldb_script_name),
+        )
+
+
+class State(object):
+    # This structure is only used for passing arguments between prepare_redex,
+    # launch_redex_binary, finalize_redex
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        config_dict: typing.Dict[str, typing.Any],
+        debugger: typing.Optional[str],
+        dex_dir: str,
+        dexen: typing.List[str],
+        extracted_apk_dir: typing.Optional[str],
+        stop_pass_idx: int,
+        lib_manager: typing.Optional[LibraryManager],
+        unpack_manager: typing.Optional[UnpackManager],
+        zip_manager: typing.Optional[ZipManager],
+    ) -> None:
+        self.args = args
+        self.config_dict = config_dict
+        self.debugger = debugger
+        self.dex_dir = dex_dir
+        self.dexen = dexen
+        self.extracted_apk_dir = extracted_apk_dir
+        self.stop_pass_idx = stop_pass_idx
+        self.lib_manager = lib_manager
+        self.unpack_manager = unpack_manager
+        self.zip_manager = zip_manager
+
+
+class RedexRunException(Exception):
+    def __init__(
+        self,
+        msg: str,
+        return_code: int,
+        abort_error: typing.Optional[str],
+        symbolized: typing.Optional[typing.List[str]],
+    ) -> None:
+        super().__init__(msg, return_code, abort_error, symbolized)
+        self.msg = msg
+        self.return_code = return_code
+        self.abort_error = abort_error
+        self.symbolized = symbolized
+
+    def __str__(self) -> str:
+        return self.msg
+
+
+def run_redex_binary(
+    state: State,
+    exception_formatter: ExceptionMessageFormatter,
+    output_line_handler: typing.Optional[typing.Callable[[str], str]],
+) -> None:
+    if state.args.redex_binary is None:
+        state.args.redex_binary = shutil.which("redex-all")
+
+    if state.args.redex_binary is None:
+        # __file__ can be /path/fb-redex.pex/redex.pyc
+        dir_name = dirname(abspath(__file__))
+        while not isdir(dir_name):
+            dir_name = dirname(dir_name)
+        state.args.redex_binary = join(dir_name, "redex-all")
+    if not isfile(state.args.redex_binary) or not os.access(
+        state.args.redex_binary, os.X_OK
+    ):
+        sys.exit(
+            "redex-all is not found or is not executable: " + state.args.redex_binary
+        )
+    logging.debug("Running redex binary at %s", state.args.redex_binary)
+
+    args: typing.List[str] = [state.args.redex_binary]
+
+    args += (
+        (["--dex-files"] + state.args.dex_files)
+        if state.args.dex_files
+        else ["--apkdir", _assert_val(state.extracted_apk_dir)]
+    )
+    args += ["--outdir", state.dex_dir]
+
+    if state.args.cmd_prefix is not None:
+        args = shlex.split(state.args.cmd_prefix) + args
+
+    if state.args.config:
+        args += ["--config", state.args.config]
+
+    if state.args.verify_none_mode or state.config_dict.get("verify_none_mode"):
+        args += ["--verify-none-mode"]
+
+    if state.args.is_art_build:
+        args += ["--is-art-build"]
+
+    if state.args.redacted:
+        args += ["--redacted"]
+
+    if state.args.disable_dex_hasher:
+        args += ["--disable-dex-hasher"]
+
+    if state.args.enable_instrument_pass or state.config_dict.get(
+        "enable_instrument_pass"
+    ):
+        args += ["--enable-instrument-pass"]
+
+    if state.args.warn:
+        args += ["--warn", state.args.warn]
+    args += ["--proguard-config=" + x for x in state.args.proguard_configs]
+    if state.args.proguard_map:
+        args += ["-Sproguard_map=" + state.args.proguard_map]
+
+    args += ["--jarpath=" + x for x in state.args.jarpaths]
+    if state.args.printseeds:
+        args += ["--printseeds=" + state.args.printseeds]
+    if state.args.used_js_assets:
+        args += ["--used-js-assets=" + x for x in state.args.used_js_assets]
+    if state.args.arch:
+        args += ["--arch=" + state.args.arch]
+    if state.args.jni_summary:
+        args += ["--jni-summary=" + state.args.jni_summary]
+    args += ["-S" + x for x in state.args.passthru]
+    args += ["-J" + x for x in state.args.passthru_json]
+
+    args += state.dexen
+
+    # Stop before a pass and output intermediate dex and IR meta data.
+    if state.stop_pass_idx != -1:
+        args += [
+            "--stop-pass",
+            str(state.stop_pass_idx),
+            "--output-ir",
+            state.args.output_ir,
+        ]
+
+    debugger = state.debugger
+    prefix: typing.List[str] = (
+        dbg_prefix(debugger, state.args.debug_source_root)
+        if debugger is not None
+        else []
+    )
     start = timer()
 
-    args = ' '.join(shlex.quote(x) for x in args)
-    if script_args.time:
-        args = 'time ' + args
-
-    if script_args.debug:
-        print(args)
+    if state.args.debug:
+        print("cd %s && %s" % (os.getcwd(), " ".join(prefix + list(map(quote, args)))))
         sys.exit()
 
-    subprocess.check_call(args, shell=True)
-    log('Dex processing finished in {:.2f} seconds'.format(timer() - start))
-
-
-def abs_glob(directory, pattern='*'):
-    """
-    Returns all files that match the specified glob inside a directory.
-    Returns absolute paths. Does not return files that start with '.'
-    """
-    for result in glob.glob(join(directory, pattern)):
-        yield join(directory, result)
-
-
-def dex_glob(directory):
-    """
-    Return the dexes in a given directory, with the primary dex first.
-    """
-    primary = 'classes.dex'
-    result = []
-    if isfile(join(directory, primary)):
-        result.append(join(directory, primary))
-
-    if isfile(join(directory, 'classes2.dex')):
-        format = 'classes%d.dex'
-        start = 2
+    env: typing.Dict[str, str] = os.environ.copy()
+    if state.args.quiet:
+        # Remove TRACE if it exists.
+        env.pop("TRACE", None)
     else:
-        format = 'secondary-%d.dex'
-        start = 1
+        # Check whether TRACE is set. If not, use "TIME:1,PM:1".
+        if "TRACE" not in env:
+            env["TRACE"] = "TIME:1,PM:1"
 
-    for i in range(start, 100):
-        dex = join(directory, format % i)
-        if not isfile(dex):
-            break
-        result += [dex]
+    env = logger.setup_trace_for_child(env)
+    logger.flush()
 
-    return result
+    add_extra_environment_args(env)
 
+    def run() -> None:
+        with bintools.SigIntHandler() as sigint_handler:
+            trace_fp = logger.get_trace_file()
+            pass_fds = [trace_fp.fileno()] if trace_fp is not sys.stderr else []
 
-def move_dexen_to_directories(root, dexpaths):
-    """
-    Move each dex file to its own directory within root and return a list of the
-    new paths. Redex will operate on each dex and put the modified dex into the
-    same directory.
-    """
-    res = []
-    for idx, dexpath in enumerate(dexpaths):
-        dexname = basename(dexpath)
-        dirpath = join(root, 'dex' + str(idx))
-        os.mkdir(dirpath)
-        shutil.move(dexpath, dirpath)
-        res.append(join(dirpath, dexname))
+            proc, handler = bintools.run_and_stream_stderr(prefix + args, env, pass_fds)
+            sigint_handler.set_started(proc)
 
-    return res
+            returncode, err_out = handler(output_line_handler)
 
+            sigint_handler.set_postprocessing()
 
-def extract_dex_from_jar(jarpath, dexpath):
-    dest_directory = dirname(dexpath)
-    with zipfile.ZipFile(jarpath) as jar:
-        contents = jar.namelist()
-        dexfiles = [name for name in contents if name.endswith('dex')]
-        assert len(dexfiles) == 1, 'Expected a single dex file'
-        dexname = jar.extract(dexfiles[0], dest_directory)
-        os.rename(join(dest_directory, dexname), dexpath)
+            if returncode == 0:
+                return
 
+            # Check for crash traces.
+            symbolized = bintools.maybe_addr2line(err_out)
+            if symbolized:
+                sys.stderr.write("\n")
+                sys.stderr.write("\n".join(symbolized))
+                sys.stderr.write("\n")
 
-def create_dex_jar(jarpath, dexpath, compression=zipfile.ZIP_STORED):
-    with zipfile.ZipFile(jarpath, mode='w') as zf:
-        zf.write(dexpath, 'classes.dex', compress_type=compression)
-        zf.writestr('/META-INF/MANIFEST.MF',
-                b'Manifest-Version: 1.0\n'
-                b'Dex-Location: classes.dex\n'
-                b'Created-By: redex\n\n')
+            abort_error = None
+            if returncode == -6:  # SIGABRT
+                abort_error = bintools.find_abort_error(err_out)
 
+            default_error_msg = "redex-all crashed with exit code {}!{}".format(
+                returncode, "\n" + abort_error if abort_error else ""
+            )
+            if IS_WINDOWS:
+                raise RuntimeError(default_error_msg)
 
-def make_temp_dir(name='', debug=False):
-    """ Make a temporary directory which will be automatically deleted """
-    directory = tempfile.mkdtemp(name)
+            gdb_script_name = write_debugger_command(
+                "gdb", state.args.debug_source_root, args
+            )
+            lldb_script_name = write_debugger_command(
+                "lldb", state.args.debug_source_root, args
+            )
+            msg = exception_formatter.format_message(
+                err_out,
+                default_error_msg,
+                gdb_script_name,
+                lldb_script_name,
+            )
+            raise RedexRunException(msg, returncode, abort_error, symbolized)
 
-    if not debug:  # In debug mode, don't delete the directory
-        def remove_directory():
-            shutil.rmtree(directory)
-        atexit.register(remove_directory)
-    return directory
-
-
-def extract_apk(apk, destination_directory):
-    with zipfile.ZipFile(apk) as z:
+    # Our CI system occasionally fails because it is trying to write the
+    # redex-all binary when this tries to run.  This shouldn't happen, and
+    # might be caused by a JVM bug.  Anyways, let's retry and hope it stops.
+    for i in range(5):
         try:
-            if z.getinfo('resources.arsc').compress_type == zipfile.ZIP_DEFLATED:
-                uncompressed_extensions.remove('.arsc')
-        except KeyError:
-            log('Unable to determine compression status of resources.arsc')
+            run()
+            break
+        except OSError as err:
+            if err.errno == errno.ETXTBSY and i < 4:
+                continue
+            raise err
 
-        log('resources.arsc will be ' +
-                ('uncompressed' if '.arsc' in uncompressed_extensions
-                    else 'compressed') + ' in output apk')
-
-        z.extractall(destination_directory)
+    logging.debug("Dex processing finished in {:.2f} seconds".format(timer() - start))
 
 
-class Api21DexMode(object):
-    """
-    On API 21+, secondary dex files are in the root of the apk and are named
-    classesN.dex for N in [2, 3, 4, ... ]
-
-    Note that this mode will also be used for apps that don't have any
-    secondary dex files.
-    """
-
-    _secondary_dir = 'assets/secondary-program-dex-jars'
-
-    def detect(self, extracted_apk_dir):
-        # Note: This mode is the fallback and we only check for it after
-        # checking for the other modes. This should return true for any
-        # apk.
-        return isfile(join(extracted_apk_dir, 'classes.dex'))
-
-    def unpackage(self, extracted_apk_dir, dex_dir):
-        jar_meta_path = join(extracted_apk_dir, self._secondary_dir,
-                             'metadata.txt')
-        if os.path.exists(jar_meta_path):
-            os.remove(jar_meta_path)
-        for path in abs_glob(extracted_apk_dir, '*.dex'):
-            shutil.move(path, dex_dir)
-
-    def repackage(self, extracted_apk_dir, dex_dir, have_locators):
-        shutil.move(join(dex_dir, 'classes.dex'), extracted_apk_dir)
-
-        if not os.path.exists(join(extracted_apk_dir,
-                              'assets', 'secondary-program-dex-jars')):
-            return
-        jar_meta_path = join(extracted_apk_dir,
-                             self._secondary_dir,
-                             'metadata.txt')
-        with open(jar_meta_path, 'w') as jar_meta:
-            jar_meta.write('.root_relative\n')
-            if have_locators:
-                jar_meta.write('.locators\n')
-            for i in range(2, 100):
-                dex_path = join(dex_dir, 'classes%d.dex' % i)
-                if not isfile(dex_path):
-                    break
-                with open(dex_path, 'rb') as dex:
-                    sha1hash = hashlib.sha1(dex.read()).hexdigest()
-                jar_meta.write(
-                    'classes%d.dex %s secondary.dex%02d.Canary\n'
-                    % (i, sha1hash, i - 1))
-                shutil.move(dex_path, extracted_apk_dir)
-
-class SubdirDexMode(object):
-    """
-    `buck build katana` places secondary dexes in a subdir with no compression
-    """
-
-    _secondary_dir = 'assets/secondary-program-dex-jars'
-
-    def detect(self, extracted_apk_dir):
-        secondary_dex_dir = join(extracted_apk_dir, self._secondary_dir)
-        return isdir(secondary_dex_dir) and \
-                len(list(abs_glob(secondary_dex_dir, '*.dex.jar')))
-
-    def unpackage(self, extracted_apk_dir, dex_dir):
-        jars = abs_glob(join(extracted_apk_dir, self._secondary_dir),
-                        '*.dex.jar')
-        for jar in jars:
-            dexpath = join(dex_dir, basename(jar))[:-4]
-            extract_dex_from_jar(jar, dexpath)
-            os.remove(jar + ".meta")
-            os.remove(jar)
-        os.remove(join(extracted_apk_dir, self._secondary_dir, 'metadata.txt'))
-        shutil.move(join(extracted_apk_dir, 'classes.dex'), dex_dir)
-
-    def repackage(self, extracted_apk_dir, dex_dir, have_locators):
-        shutil.move(join(dex_dir, 'classes.dex'), extracted_apk_dir)
-
-        jar_meta_path = join(dex_dir, 'metadata.txt')
-        with open(jar_meta_path, 'w') as jar_meta:
-            if have_locators:
-                jar_meta.write('.locators\n')
-            for i in range(1, 100):
-                oldpath = join(dex_dir, 'classes%d.dex' % (i + 1))
-                dexpath = join(dex_dir, 'secondary-%d.dex' % i)
-                if not isfile(oldpath):
-                    break
-                shutil.move(oldpath, dexpath)
-                jarpath = dexpath + '.jar'
-                create_dex_jar(jarpath, dexpath)
-                dex_meta_base = 'secondary-%d.dex.jar.meta' % i
-                dex_meta_path = join(dex_dir, dex_meta_base)
-                with open(dex_meta_path, 'w') as dex_meta:
-                    dex_meta.write('jar:%d dex:%d\n' %
-                                   (getsize(jarpath), getsize(dexpath)))
-                with open(jarpath, 'rb') as jar:
-                    sha1hash = hashlib.sha1(jar.read()).hexdigest()
-                shutil.move(dex_meta_path,
-                            join(extracted_apk_dir, self._secondary_dir))
-                shutil.move(jarpath, join(extracted_apk_dir,
-                                          self._secondary_dir))
-                jar_meta.write(
-                    'secondary-%d.dex.jar %s secondary.dex%02d.Canary\n'
-                    % (i, sha1hash, i))
-        shutil.move(jar_meta_path, join(extracted_apk_dir, self._secondary_dir))
-
-class XZSDexMode(object):
-    """
-    Secondary dex files are packaged in individual jar files where are then
-    concatenated together and compressed with xz.
-
-    ... This format is completely insane.
-    """
-    _xzs_dir = 'assets/secondary-program-dex-jars'
-    _xzs_filename = 'secondary.dex.jar.xzs'
-
-    def detect(self, extracted_apk_dir):
-        path = join(extracted_apk_dir, self._xzs_dir,
-                self._xzs_filename)
-        return isfile(path)
-
-    def unpackage(self, extracted_apk_dir, dex_dir):
-        src = join(extracted_apk_dir, self._xzs_dir,
-                self._xzs_filename)
-        dest = join(dex_dir, self._xzs_filename)
-
-        # Move secondary dexen
-        shutil.move(src, dest)
-
-        # concat_jar is a bunch of .dex.jar files concatenated together.
-        concat_jar = join(dex_dir, 'secondary.dex.jar')
-        cmd = 'cat {} | xz -d --threads 6 > {}'.format(dest, concat_jar)
-        subprocess.check_call(cmd, shell=True)
-
-        # Sizes of the concatenated .dex.jar files are stored in .meta files.
-        # Read the sizes of each .dex.jar file and un-concatenate them.
-        jar_size_regex = 'jar:(\d+)'
-        secondary_dir = join(extracted_apk_dir, self._xzs_dir)
-        jar_sizes = {}
-        for i in range(1, 100):
-            filename = 'secondary-' + str(i) + '.dex.jar.xzs.tmp~.meta'
-            metadata_path = join(secondary_dir, filename)
-            if isfile(metadata_path):
-                with open(metadata_path) as f:
-                    jar_sizes[i] = \
-                            int(re.match(jar_size_regex, f.read()).group(1))
-                os.remove(metadata_path)
-            else:
-                break
-
-        with open(concat_jar, 'rb') as cj:
-            for i in range(1, len(jar_sizes) + 1):
-                jarpath = join(dex_dir, 'secondary-%d.dex.jar' % i)
-                with open(jarpath, 'wb') as jar:
-                    jar.write(cj.read(jar_sizes[i]))
-
-        for j in jar_sizes.keys():
-            assert jar_sizes[j] == getsize(dex_dir + '/secondary-' + str(j) + '.dex.jar')
-
-        assert sum(jar_sizes.values()) == getsize(concat_jar)
-
-        # Clean up everything other than dexen in the dex directory
-        os.remove(concat_jar)
-        os.remove(dest)
-
-        # Lastly, unzip all the jar files and delete them
-        for jarpath in abs_glob(dex_dir, '*.jar'):
-            extract_dex_from_jar(jarpath, jarpath[:-4])
-            os.remove(jarpath)
-
-        # Move primary dex
-        shutil.move(join(extracted_apk_dir, 'classes.dex'), dex_dir)
-
-    def repackage(self, extracted_apk_dir, dex_dir, have_locators):
-        # Move primary dex
-        shutil.move(join(dex_dir, 'classes.dex'), extracted_apk_dir)
-
-        dex_sizes = {}
-        jar_sizes = {}
-
-        # Package each dex into a jar
-        for i in range(1, 100):
-            oldpath = join(dex_dir, 'classes%d.dex' % (i + 1))
-            if not isfile(oldpath):
-                break
-            dexpath = join(dex_dir, 'secondary-%d.dex' % i)
-            shutil.move(oldpath, dexpath)
-            jarpath = dexpath + '.jar'
-            create_dex_jar(jarpath, dexpath)
-            dex_sizes[jarpath] = getsize(dexpath)
-            jar_sizes[jarpath] = getsize(jarpath)
-
-        concat_jar_path = join(dex_dir, 'secondary.dex.jar')
-        concat_jar_meta = join(dex_dir, 'metadata.txt')
-
-        # Concatenate the jar files and create corresponding metadata files
-        with open(concat_jar_path, 'wb') as concat_jar:
-            with open(concat_jar_meta, 'w') as concat_meta:
-                if have_locators:
-                    concat_meta.write('.locators\n')
-
-                for i in range(1, 100):
-                    jarpath = join(dex_dir, 'secondary-%d.dex.jar' % i)
-                    if not isfile(jarpath):
-                        break
-
-                    with open(jarpath + '.xzs.tmp~.meta', 'wb') as metadata:
-                        sizes = 'jar:{} dex:{}'.format(
-                            jar_sizes[jarpath], dex_sizes[jarpath])
-                        metadata.write(bytes(sizes, 'ascii'))
-
-                    with open(jarpath, 'rb') as jar:
-                        contents = jar.read()
-                        concat_jar.write(contents)
-                        sha1hash = hashlib.sha1(contents).hexdigest()
-
-                    concat_meta.write(
-                        '%s.xzs.tmp~ %s secondary.dex%02d.Canary\n'
-                        % (basename(jarpath), sha1hash, i))
-
-        assert getsize(concat_jar_path) == sum(getsize(x)
-                for x in abs_glob(dex_dir, 'secondary-*.dex.jar'))
-
-        # XZ-compress the result
-        subprocess.check_call(['xz', '-z6', '--check=crc32', '--threads=6',
-                concat_jar_path])
-
-        # Copy all the archive and metadata back to the apk directory
-        secondary_dex_dir = join(extracted_apk_dir, self._xzs_dir)
-        for path in abs_glob(dex_dir, '*.meta'):
-            shutil.copy(path, secondary_dex_dir)
-        shutil.copy(concat_jar_meta, join(secondary_dex_dir, 'metadata.txt'))
-        shutil.copy(concat_jar_path + '.xz',
-                join(secondary_dex_dir, self._xzs_filename))
-
-
-# These are checked in order from top to bottom. The first one to have detect()
-# return true will be used.
-SECONDARY_DEX_MODES = [
-    XZSDexMode(),
-    SubdirDexMode(),
-    Api21DexMode(),
-]
-
-
-def detect_secondary_dex_mode(extracted_apk_dir):
-    for mode in SECONDARY_DEX_MODES:
-        if mode.detect(extracted_apk_dir):
-            return mode
-    sys.exit('Unknown secondary dex mode')
-
-
-def should_compress(filename):
-    return not any(filename.endswith(ext) for ext in uncompressed_extensions)
-
-
-def zipalign(unaligned_apk_path, output_apk_path):
+def zipalign(
+    unaligned_apk_path: str,
+    output_apk_path: str,
+    ignore_zipalign: bool,
+    page_align: bool,
+) -> None:
     # Align zip and optionally perform good compression.
     try:
-        zipalign = [join(find_android_build_tools(), 'zipalign')]
-    except:
-        # We couldn't find zipalign via ANDROID_SDK.  Try PATH.
-        zipalign = ['zipalign']
-    try:
-        subprocess.check_call(zipalign +
-                              ['4', unaligned_apk_path, output_apk_path])
-    except:
-        print("Couldn't find zipalign.  Your APK may not be fully optimized.")
+        zipalign = [
+            find_android_build_tool("zipalign.exe" if IS_WINDOWS else "zipalign"),
+            "4",
+            unaligned_apk_path,
+            output_apk_path,
+        ]
+        if page_align:
+            zipalign.insert(1, "-p")
+
+        p = subprocess.Popen(zipalign, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out, _ = p.communicate()
+        if p.returncode == 0:
+            os.remove(unaligned_apk_path)
+            return
+        out_str = out.decode(sys.getfilesystemencoding())
+        raise RuntimeError("Failed to execute zipalign, output: {}".format(out_str))
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            print("Couldn't find zipalign. See README.md to resolve this.")
+        if not ignore_zipalign:
+            raise e
+        shutil.copy(unaligned_apk_path, output_apk_path)
+    except BaseException:
+        if not ignore_zipalign:
+            raise
         shutil.copy(unaligned_apk_path, output_apk_path)
     os.remove(unaligned_apk_path)
 
 
-def create_output_apk(extracted_apk_dir, output_apk_path, sign, keystore,
-        key_alias, key_password):
-
-    # Remove old signature files
-    for f in abs_glob(extracted_apk_dir, 'META-INF/*'):
-        cert_path = join(extracted_apk_dir, f)
-        if isfile(cert_path):
-            os.remove(cert_path)
-
-    directory = make_temp_dir('.redex_unaligned', False)
-    unaligned_apk_path = join(directory, 'redex-unaligned.apk')
-
-    if isfile(unaligned_apk_path):
-        os.remove(unaligned_apk_path)
-
-    # Create new zip file
-    with zipfile.ZipFile(unaligned_apk_path, 'w') as unaligned_apk:
-        for dirpath, dirnames, filenames in os.walk(extracted_apk_dir):
-            for filename in filenames:
-                compress = zipfile.ZIP_DEFLATED if should_compress(filename) \
-                        else zipfile.ZIP_STORED
-                filepath = join(dirpath, filename)
-                archivepath = filepath[len(extracted_apk_dir):]
-                unaligned_apk.write(filepath, archivepath,
-                        compress_type=compress)
-
-    # Add new signature
-    if sign:
-        subprocess.check_call([
-                'jarsigner',
-                '-sigalg', 'SHA1withRSA',
-                '-digestalg', 'SHA1',
-                '-keystore', keystore,
-                '-storepass', key_password,
-                unaligned_apk_path, key_alias],
-            stdout=sys.stderr)
-
+def align_and_sign_output_apk(
+    unaligned_apk_path: str,
+    output_apk_path: str,
+    reset_timestamps: bool,
+    sign: bool,
+    keystore: str,
+    key_alias: str,
+    key_password: str,
+    ignore_zipalign: bool,
+    page_align: bool,
+) -> None:
     if isfile(output_apk_path):
         os.remove(output_apk_path)
 
-    zipalign(unaligned_apk_path, output_apk_path)
+    try:
+        os.makedirs(dirname(output_apk_path))
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+    zipalign(unaligned_apk_path, output_apk_path, ignore_zipalign, page_align)
+
+    if reset_timestamps:
+        ZipReset.reset_file(output_apk_path)
+
+    # Add new signature
+    if sign:
+        sign_apk(keystore, key_password, key_alias, output_apk_path)
 
 
-def merge_proguard_map_with_rename_output(
-        input_apk_path,
-        apk_output_path,
-        config_dict,
-        pg_file):
-    log('running merge proguard step')
-    redex_rename_map_path = config_dict['RenameClassesPass']['class_rename']
-    log('redex map is at ' + str(redex_rename_map_path))
-    if os.path.isfile(redex_rename_map_path):
-        redex_pg_file = "redex-class-rename-map.txt"
-        # find proguard file
-        if pg_file:
-            output_dir = os.path.dirname(apk_output_path)
-            output_file = output_file = join(output_dir, redex_pg_file)
-            update_proguard_mapping_file(pg_file, redex_rename_map_path, output_file)
-            log('merging proguard map with redex class rename map')
-            log('pg mapping file input is ' + str(pg_file))
-            log('wrote redex pg format mapping file to ' + str(output_file))
-        else:
-            log('no proguard map file found')
-    else:
-        log('Skipping merging of rename maps, since redex rename map file not found')
-
-
-def update_proguard_mapping_file(pg_map, redex_map, output_file):
-    with open(pg_map, 'r') as pg_map, open(redex_map, 'r') as redex_map, open(output_file, 'w') as output:
-        redex_dict = {}
-        for line in redex_map:
-            pair = line.split(' -> ')
-            unmangled = pgize(pair[0])
-            mangled = pgize(pair[1])
-            redex_dict[unmangled] = mangled
-        for line in pg_map:
-            match_obj = re.match(r'^(.*) -> (.*):', line)
-            if match_obj:
-                unmangled = match_obj.group(1)
-                mangled = match_obj.group(2)
-                new_mapping = line.rstrip()
-                if unmangled in redex_dict:
-                    out_mangled = redex_dict[unmangled]
-                    new_mapping = unmangled + ' -> ' + redex_dict[unmangled] + ':'
-                    print(new_mapping, file=output)
-                else:
-                    print(line.rstrip(), file=output)
-            else:
-                print(line.rstrip(), file=output)
-
-
-def copy_stats_to_out_dir(tmp, apk_output_path):
+def copy_file_to_out_dir(
+    tmp: str, apk_output_path: str, name: str, human_name: str, out_name: str
+) -> None:
     output_dir = os.path.dirname(apk_output_path)
-    output_stats_path = os.path.join(output_dir, "redex-stats.txt")
-    if os.path.isfile(tmp + '/stats.txt'):
-        subprocess.check_call(['cp', tmp + '/stats.txt', output_stats_path])
-        log('Copying stats to output dir')
+    output_path = os.path.join(output_dir, out_name)
+    tmp_path = tmp + "/" + name
+    if os.path.isfile(tmp_path):
+        shutil.copy2(tmp_path, output_path)
+        logging.debug("Copying " + human_name + " map to output_dir: " + output_path)
     else:
-        log('Skipping stats copy, since no file found to copy')
-
-def copy_filename_map_to_out_dir(tmp, apk_output_path):
-    output_dir = os.path.dirname(apk_output_path)
-    output_filemap_path = os.path.join(output_dir, "redex-src-strings-map.txt")
-    if os.path.isfile(tmp + '/filename_mappings.txt'):
-        subprocess.check_call(['cp', tmp + '/filename_mappings.txt', output_filemap_path])
-        log('Copying src string map to output dir')
-    else:
-        log('Skipping src string map copy, since no file found to copy')
-
-    output_methodmap_path = os.path.join(output_dir, "redex-method-id-map.txt")
-    if os.path.isfile(tmp + '/method_mapping.txt'):
-        subprocess.check_call(['cp', tmp + '/method_mapping.txt', output_methodmap_path])
-        log('Copying method id map to output dir')
-    else:
-        log('Skipping method id map copy, since no file found to copy')
+        logging.debug("Skipping " + human_name + " copy, since no file found to copy")
 
 
-def arg_parser(config=None, keystore=None, keyalias=None, keypass=None):
+def copy_all_file_to_out_dir(
+    tmp: str, apk_output_path: str, ext: str, human_name: str
+) -> None:
+    tmp_path = tmp + "/" + ext
+    for file in glob.glob(tmp_path):
+        filename = os.path.basename(file)
+        copy_file_to_out_dir(
+            tmp, apk_output_path, filename, human_name + " " + filename, filename
+        )
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.sign:
+        for arg_name in ["keystore", "keyalias", "keypass"]:
+            if getattr(args, arg_name) is None:
+                raise argparse.ArgumentTypeError(
+                    "Could not find a suitable default for --{} and no value "
+                    "was provided.  This argument is required when --sign "
+                    "is used".format(arg_name)
+                )
+
+
+def arg_parser(
+    binary: typing.Optional[str] = None,
+    config: typing.Optional[str] = None,
+    keystore: typing.Optional[str] = None,
+    keyalias: typing.Optional[str] = None,
+    keypass: typing.Optional[str] = None,
+) -> argparse.ArgumentParser:
     description = """
 Given an APK, produce a better APK!
 
 """
     parser = argparse.ArgumentParser(
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            description=description)
+        formatter_class=argparse.RawDescriptionHelpFormatter, description=description
+    )
 
-    parser.add_argument('input_apk', help='Input APK file')
-    parser.add_argument('-o', '--out', nargs='?', default='redex-out.apk',
-            help='Output APK file name (defaults to redex-out.apk)')
-    parser.add_argument('-j', '--jarpath', nargs='?')
+    parser.add_argument("input_apk", nargs="?", help="Input APK file")
+    parser.add_argument(
+        "-o",
+        "--out",
+        nargs="?",
+        type=os.path.realpath,
+        default="redex-out.apk",
+        help="Output APK file name (defaults to redex-out.apk)",
+    )
+    parser.add_argument(
+        "-j",
+        "--jarpath",
+        dest="jarpaths",
+        action="append",
+        default=[],
+        help="Path to dependent library jar file",
+    )
 
-    parser.add_argument('redex_binary', nargs='?', default='redex-all',
-            help='Path to redex binary')
+    parser.add_argument(
+        "--redex-binary", nargs="?", default=binary, help="Path to redex binary"
+    )
 
-    parser.add_argument('-c', '--config', default=config,
-            help='Configuration file')
+    parser.add_argument("-c", "--config", default=config, help="Configuration file")
 
-    parser.add_argument('-t', '--time', action='store_true',
-            help='Run redex passes with `time` to print CPU and wall time')
+    argparse_yes_no_flag(parser, "sign", help="Sign the apk after optimizing it")
+    parser.add_argument("-s", "--keystore", nargs="?", default=keystore)
+    parser.add_argument("-a", "--keyalias", nargs="?", default=keyalias)
+    parser.add_argument("-p", "--keypass", nargs="?", default=keypass)
 
-    parser.add_argument('--sign', action='store_true',
-            help='Sign the apk after optimizing it')
-    parser.add_argument('-s', '--keystore', nargs='?', default=keystore)
-    parser.add_argument('-a', '--keyalias', nargs='?', default=keyalias)
-    parser.add_argument('-p', '--keypass', nargs='?', default=keypass)
+    parser.add_argument(
+        "-u",
+        "--unpack-only",
+        action="store_true",
+        help="Unpack the apk and print the unpacked directories, don't "
+        "run any redex passes or repack the apk",
+    )
 
-    parser.add_argument('-u', '--unpack-only', action='store_true',
-            help='Unpack the apk and print the unpacked directories, don\'t '
-                    'run any redex passes or repack the apk')
+    parser.add_argument(
+        "--unpack-dest",
+        nargs=1,
+        help="Specify the base name of the destination directories; works with -u",
+    )
 
-    parser.add_argument('-w', '--warn', nargs='?',
-            help='Control verbosity of warnings')
+    parser.add_argument("-w", "--warn", nargs="?", help="Control verbosity of warnings")
 
-    parser.add_argument('-d', '--debug', action='store_true',
-            help='Unpack the apk and print the redex command line to run')
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Unpack the apk and print the redex command line to run",
+    )
 
-    parser.add_argument('-m', '--proguard-map', nargs='?',
-            help='Path to proguard mapping.txt for deobfuscating names')
+    parser.add_argument(
+        "--dev", action="store_true", help="Optimize for development speed"
+    )
 
-    parser.add_argument('-P', '--proguard-config', nargs='?',
-            help='Path to proguard config')
+    parser.add_argument(
+        "-m",
+        "--proguard-map",
+        nargs="?",
+        help="Path to proguard mapping.txt for deobfuscating names",
+    )
 
-    parser.add_argument('-k', '--keep', nargs='?',
-            help='Path to file containing classes to keep')
+    parser.add_argument("--printseeds", nargs="?", help="File to print seeds to")
 
-    parser.add_argument('-S', dest='passthru', action='append', default=[],
-            help='Arguments passed through to redex')
-    parser.add_argument('-J', dest='passthru_json', action='append', default=[],
-            help='JSON-formatted arguments passed through to redex')
+    parser.add_argument(
+        "--used-js-assets",
+        action="append",
+        default=[],
+        help="A JSON file (or files) containing a list of resources used by JS",
+    )
+
+    parser.add_argument(
+        "-P",
+        "--proguard-config",
+        dest="proguard_configs",
+        action="append",
+        default=[],
+        help="Path to proguard config",
+    )
+
+    parser.add_argument(
+        "-k",
+        "--keep",
+        nargs="?",
+        help="[deprecated] Path to file containing classes to keep",
+    )
+
+    parser.add_argument(
+        "-A",
+        "--arch",
+        nargs="?",
+        help='Architecture; one of arm/armv7/arm64/x86_64/x86"',
+    )
+
+    parser.add_argument(
+        "-S",
+        dest="passthru",
+        action="append",
+        default=[],
+        help="Arguments passed through to redex",
+    )
+    parser.add_argument(
+        "-J",
+        dest="passthru_json",
+        action="append",
+        default=[],
+        help="JSON-formatted arguments passed through to redex",
+    )
+
+    parser.add_argument("--lldb", action="store_true", help="Run redex binary in lldb")
+    parser.add_argument("--gdb", action="store_true", help="Run redex binary in gdb")
+    parser.add_argument(
+        "--ignore-zipalign", action="store_true", help="Ignore if zipalign is not found"
+    )
+    parser.add_argument(
+        "--verify-none-mode",
+        action="store_true",
+        help="Enable verify-none mode on redex",
+    )
+    parser.add_argument(
+        "--enable-instrument-pass",
+        action="store_true",
+        help="Enable InstrumentPass if any",
+    )
+    parser.add_argument(
+        "--is-art-build",
+        action="store_true",
+        help="States that this is an art only build",
+    )
+    parser.add_argument(
+        "--redacted",
+        action="store_true",
+        default=False,
+        help="Specifies how dex files should be laid out",
+    )
+    parser.add_argument(
+        "--disable-dex-hasher", action="store_true", help="Disable DexHasher"
+    )
+    parser.add_argument(
+        "--page-align-libs",
+        action="store_true",
+        help="Preserve 4k page alignment for uncompressed libs",
+    )
+
+    parser.add_argument(
+        "--side-effect-summaries", help="Side effect information for external methods"
+    )
+
+    parser.add_argument(
+        "--escape-summaries", help="Escape information for external methods"
+    )
+
+    parser.add_argument(
+        "--stop-pass",
+        default="",
+        help="Stop before a pass and dump intermediate dex and IR meta data to a directory",
+    )
+    parser.add_argument(
+        "--output-ir",
+        default="",
+        help="Stop before stop_pass and dump intermediate dex and IR meta data to output_ir folder",
+    )
+    parser.add_argument(
+        "--debug-source-root",
+        default=None,
+        nargs="?",
+        help="Root directory that all references to source files in debug information is given relative to.",
+    )
+
+    parser.add_argument(
+        "--always-clean-up",
+        action="store_true",
+        help="Clean up temporaries even under failure",
+    )
+
+    parser.add_argument("--cmd-prefix", type=str, help="Prefix redex-all with")
+
+    parser.add_argument(
+        "--reset-zip-timestamps",
+        action="store_true",
+        help="Reset zip timestamps for deterministic output",
+    )
+
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Do not be verbose, and override TRACE.",
+    )
+
+    parser.add_argument("--android-sdk-path", type=str, help="Path to Android SDK")
+
+    parser.add_argument(
+        "--suppress-android-jar-check",
+        action="store_true",
+        help="Do not look for an `android.jar` in the jar paths",
+    )
+
+    parser.add_argument(
+        "--log-level",
+        default="warning",
+        help="Specify the python logging level",
+    )
+
+    parser.add_argument(
+        "--packed-profiles",
+        type=str,
+        help="Path to packed profiles (expects tar.xz)",
+    )
+
+    parser.add_argument(
+        "--secondary-packed-profiles",
+        type=str,
+        help="Path to packed secondary profiles (expects tar.xz)",
+    )
+
+    parser.add_argument(
+        "--jni-summary",
+        default=None,
+        type=str,
+        help="Path to JNI summary directory of json files.",
+    )
+
+    # Passthrough mode.
+    parser.add_argument("--outdir", type=str)
+    parser.add_argument("--dex-files", nargs="+", default=[])
 
     return parser
 
-def relocate_tmp(d, newtmp):
-    """
-    Walks through the config dict and changes and string value that begins with
-    "/tmp/" to our tmp dir for this run. This is to avoid collisions of
-    simultaneously running redexes.
-    """
-    for k, v in d.items():
-        if isinstance(v, dict):
-            relocate_tmp(v, newtmp)
-        else:
-            if isinstance(v, str) and v.startswith("/tmp/"):
-                d[k] = newtmp + "/" + v[5:]
-                log("Replaced {0} in config with {1}".format(v, d[k]))
 
-def run_redex(args):
+def _has_android_library_jars(pg_file: str) -> bool:
+    # We do not tokenize properly here. Minimum effort.
+    def _gen() -> typing.Generator[str, None, None]:
+        with open(pg_file, "r") as f:
+            for line in f:
+                yield line.strip()
+
+    gen = _gen()
+    for line in gen:
+        if line == "-libraryjars":
+            line = next(gen, "a")
+            parts = line.split(":")
+            for p in parts:
+                if p.endswith("android.jar"):
+                    return True
+    return False
+
+
+def _check_android_sdk(args: argparse.Namespace) -> None:
+    if args.suppress_android_jar_check:
+        logging.debug("No SDK jar check done")
+        return
+
+    for jarpath in args.jarpaths:
+        if jarpath.endswith("android.jar"):
+            logging.debug("Found an SDK-looking jar: %s", jarpath)
+            return
+
+    for pg_config in args.proguard_configs:
+        if _has_android_library_jars(pg_config):
+            logging.debug("Found an SDK-looking jar in PG file %s", pg_config)
+            return
+
+    # Check whether we can find and add one.
+    logging.info(
+        "No SDK jar found, attempting to find one. If the detection is wrong, add `--suppress-android-jar-check`."
+    )
+
+    try:
+        sdk_path = get_android_sdk_path()
+        logging.debug("SDK path is %s", sdk_path)
+        platforms = join(sdk_path, "platforms")
+        if not os.path.exists(platforms):
+            raise RuntimeError("platforms directory does not exist")
+        VERSION_REGEXP = r"android-(\d+)"
+        version = max(
+            (
+                -1,
+                *[
+                    int(m.group(1))
+                    for d in os.listdir(platforms)
+                    for m in [re.match(VERSION_REGEXP, d)]
+                    if m
+                ],
+            ),
+        )
+        if version == -1:
+            raise RuntimeError(f"No android jar directories found in {platforms}")
+        jar_path = join(platforms, f"android-{version}", "android.jar")
+        if not os.path.exists(jar_path):
+            raise RuntimeError(f"{jar_path} not found")
+        logging.info("Adding SDK jar path %s", jar_path)
+        args.jarpaths.append(jar_path)
+    except BaseException as e:
+        logging.warning("Could not find an SDK jar: %s", e)
+
+
+def _has_config_val(args: argparse.Namespace, path: typing.Iterable[str]) -> bool:
+    try:
+        with open(args.config, "r") as f:
+            json_obj = json.load(f)
+        for item in path:
+            if item not in json_obj:
+                logging.debug("Did not find %s in %s", item, json_obj)
+                return False
+            json_obj = json_obj[item]
+        return True
+    except BaseException as e:
+        logging.error("%s", e)
+        return False
+
+
+def _check_shrinker_heuristics(args: argparse.Namespace) -> None:
+    arg_template = "inliner.reg_alloc_random_forest="
+    for arg in args.passthru:
+        if arg.startswith(arg_template):
+            return
+
+    if _has_config_val(args, ["inliner", "reg_alloc_random_forest"]):
+        return
+
+    # Nothing found, check whether we have files embedded
+    logging.info("No shrinking heuristic found, searching for default.")
+    try:
+        # pyre-ignore[21]
+        from generated_shrinker_regalloc_heuristics import SHRINKER_HEURISTICS_FILE
+
+        logging.info("Found embedded shrinker heuristics")
+        tmp_dir = make_temp_dir("shrinker_heuristics")
+        filename = os.path.join(tmp_dir, "shrinker.forest")
+        logging.info("Writing shrinker heuristics to %s", filename)
+        with open(filename, "wb") as f:
+            f.write(SHRINKER_HEURISTICS_FILE)
+        arg = arg_template + filename
+        args.passthru.append(arg)
+    except ImportError:
+        logging.info("No embedded files, please add manually!")
+
+
+def _check_android_sdk_api(args: argparse.Namespace) -> None:
+    arg_template = "android_sdk_api_{level}_file="
+    arg_re = re.compile("^" + arg_template.format(level="(\\d+)"))
+    for arg in args.passthru:
+        if arg_re.match(arg):
+            return
+
+    # Nothing found, check whether we have files embedded
+    logging.info("No android_sdk_api_XX_file parameters found.")
+    try:
+        # pyre-ignore[21]
+        import generated_apilevels as ga
+
+        levels = ga.get_api_levels()
+        logging.info("Found embedded API levels: %s", levels)
+        api_dir = make_temp_dir("api_levels")
+        logging.info("Writing API level files to %s", api_dir)
+        for level in levels:
+            blob = ga.get_api_level_file(level)
+            filename = os.path.join(api_dir, f"framework_classes_api_{level}.txt")
+            with open(filename, "wb") as f:
+                f.write(blob)
+            arg = arg_template.format(level=level) + filename
+            args.passthru.append(arg)
+    except ImportError:
+        logging.warning("No embedded files, please add manually!")
+
+
+def _handle_profiles(args: argparse.Namespace) -> None:
+    if not args.packed_profiles:
+        return
+
+    directory = make_temp_dir(".redex_profiles", False)
+    unpack_tar_xz(args.packed_profiles, directory)
+
+    # Create input for method profiles.
+    method_profiles_str = ", ".join(
+        f'"{f.path}"'
+        for f in os.scandir(directory)
+        if f.is_file() and ("method_stats" in f.name or "agg_stats" in f.name)
+    )
+    if method_profiles_str:
+        logging.debug("Found method profiles: %s", method_profiles_str)
+        args.passthru_json.append(f"agg_method_stats_files=[{method_profiles_str}]")
+    else:
+        logging.info("No method profiles found in %s", args.packed_profiles)
+
+    # Create input for basic blocks.
+    # Note: at the moment, only look for ColdStart.
+    join_str = ";" if IS_WINDOWS else ":"
+    block_profiles_str = join_str.join(
+        f"{f.path}"
+        for f in os.scandir(directory)
+        if f.is_file() and f.name.startswith("block_profiles_")
+    )
+    if block_profiles_str:
+        logging.debug("Found block profiles: %s", block_profiles_str)
+        # Assume there's at most one.
+        args.passthru.append(
+            f"InsertSourceBlocksPass.profile_files={block_profiles_str}"
+        )
+    else:
+        logging.info("No block profiles found in %s", args.packed_profiles)
+
+
+def _handle_secondary_method_profiles(args: argparse.Namespace) -> None:
+    if not args.secondary_packed_profiles:
+        return
+
+    directory = make_temp_dir(".redex_profiles", False)
+    unpack_tar_xz(args.secondary_packed_profiles, directory)
+
+    # Create input for secondary method profiles.
+    secondary_method_profiles_str = ", ".join(
+        f'"{f.path}"'
+        for f in os.scandir(directory)
+        if f.is_file()
+        and ("secondary_method_stats" in f.name or "secondary_stats" in f.name)
+    )
+    if secondary_method_profiles_str:
+        logging.debug(
+            "Found secondary_method profiles: %s", secondary_method_profiles_str
+        )
+        args.passthru_json.append(
+            f"secondary_method_stats_files=[{secondary_method_profiles_str}]"
+        )
+    else:
+        logging.info(
+            "No secondary method profiles found in %s", args.secondary_packed_profiles
+        )
+
+
+def prepare_redex(args: argparse.Namespace) -> State:
+    logging.debug("Preparing...")
     debug_mode = args.unpack_only or args.debug
 
-    unpack_start_time = timer()
-    extracted_apk_dir = make_temp_dir('.redex_extracted_apk', debug_mode)
+    if args.android_sdk_path:
+        add_android_sdk_path(args.android_sdk_path)
 
-    log('Extracting apk...')
-    extract_apk(args.input_apk, extracted_apk_dir)
+    # avoid accidentally mixing up file formats since we now support
+    # both apk files and Android bundle files
+    file_ext = get_file_ext(args.input_apk)
+    if not args.unpack_only:
+        assert file_ext == get_file_ext(args.out), (
+            'Input file extension ("'
+            + file_ext
+            + '") should be the same as output file extension ("'
+            + get_file_ext(args.out)
+            + '")'
+        )
 
-    dex_mode = detect_secondary_dex_mode(extracted_apk_dir)
-    log('Detected dex mode ' + str(type(dex_mode).__name__))
-    dex_dir = make_temp_dir('.redex_dexen', debug_mode)
-
-    log('Unpacking dex files')
-    dex_mode.unpackage(extracted_apk_dir, dex_dir)
-
-    # Some of the native libraries can be concatenated together into one
-    # xz-compressed file. We need to decompress that file so that we can scan
-    # through it looking for classnames.
-    xz_compressed_libs = join(extracted_apk_dir, 'assets/lib/libs.xzs')
-    temporary_lib_file = join(extracted_apk_dir, 'lib/concated_native_libs.so')
-    if os.path.exists(xz_compressed_libs):
-        cmd = 'xz -d --stdout {} > {}'.format(
-                shlex.quote(xz_compressed_libs),
-                shlex.quote(temporary_lib_file))
-        subprocess.check_call(cmd, shell=True)
-
-    if args.unpack_only:
-        print('APK: ' + extracted_apk_dir)
-        print('DEX: ' + dex_dir)
-        sys.exit()
-
-    # Move each dex to a separate temporary directory to be operated by
-    # redex.
-    dexen = move_dexen_to_directories(dex_dir, dex_glob(dex_dir))
-    log('Unpacking APK finished in {:.2f} seconds'.format(
-            timer() - unpack_start_time))
+    extracted_apk_dir = None
+    dex_dir = None
+    if args.unpack_only and args.unpack_dest:
+        if args.unpack_dest[0] == ".":
+            # Use APK's name
+            unpack_dir_basename = os.path.splitext(args.input_apk)[0]
+        else:
+            unpack_dir_basename = args.unpack_dest[0]
+        extracted_apk_dir = unpack_dir_basename + ".redex_extracted_apk"
+        dex_dir = unpack_dir_basename + ".redex_dexen"
+        try:
+            os.makedirs(extracted_apk_dir)
+            os.makedirs(dex_dir)
+            extracted_apk_dir = os.path.abspath(extracted_apk_dir)
+            dex_dir = os.path.abspath(dex_dir)
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                print("Error: destination directory already exists!")
+                print("APK: " + extracted_apk_dir)
+                print("DEX: " + dex_dir)
+                sys.exit(1)
+            raise e
 
     config = args.config
     binary = args.redex_binary
-    log('Using config ' + (config if config is not None else '(default)'))
-    log('Using binary ' + binary)
+    logging.debug("Using config %s", config if config is not None else "(default)")
+    logging.debug("Using binary %s", binary if binary is not None else "(default)")
 
-    if config is None:
+    if args.unpack_only or config is None:
         config_dict = {}
-        passes_list = []
     else:
         with open(config) as config_file:
-            config_dict = json.load(config_file)
-            passes_list = config_dict['redex']['passes']
+            try:
+                lines = config_file.readlines()
+                config_dict = json.loads(remove_comments(lines))
+            except ValueError:
+                raise ValueError(
+                    "Invalid JSON in ReDex config file: %s" % config_file.name
+                )
 
-    newtmp = tempfile.mkdtemp()
-    log('Replacing /tmp in config with {}'.format(newtmp))
+    # stop_pass_idx >= 0 means need stop before a pass and dump intermediate result
+    stop_pass_idx = -1
+    if args.stop_pass:
+        passes_list = config_dict.get("redex", {}).get("passes", [])
+        stop_pass_idx = get_stop_pass_idx(passes_list, args.stop_pass)
+        if not args.output_ir or isfile(args.output_ir):
+            print("Error: output_ir should be a directory")
+            sys.exit(1)
+        try:
+            os.makedirs(args.output_ir)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise e
 
-    # Fix up the config dict to relocate all /tmp references
-    relocate_tmp(config_dict, newtmp)
+    with BuckPartScope("redex::Unpacking", "Unpacking Redex input"):
+        logging.debug("Unpacking...")
+        unpack_start_time = timer()
+        if not extracted_apk_dir:
+            extracted_apk_dir = make_temp_dir(".redex_extracted_apk", debug_mode)
 
-    # Rewrite the relocated config file to our tmp, for use by redex binary
-    if config is not None:
-        config = newtmp + "/rewritten.config"
-        with open(config, 'w') as fp:
-            json.dump(config_dict, fp)
+        directory = make_temp_dir(".redex_unaligned", False)
+        unaligned_apk_path = join(directory, "redex-unaligned." + file_ext)
+        zip_manager = ZipManager(args.input_apk, extracted_apk_dir, unaligned_apk_path)
+        zip_manager.__enter__()
 
-    log('Running redex-all on {} dex files '.format(len(dexen)))
-    run_pass(binary,
-             args,
-             config,
-             config_dict,
-             extracted_apk_dir,
-             dex_dir,
-             dexen)
+        if not dex_dir:
+            dex_dir = make_temp_dir(".redex_dexen", debug_mode)
 
-    # This file was just here so we could scan it for classnames, but we don't
-    # want to pack it back up into the apk
-    if os.path.exists(temporary_lib_file):
-        os.remove(temporary_lib_file)
+        is_bundle = isfile(join(extracted_apk_dir, "BundleConfig.pb"))
+        unpack_manager = UnpackManager(
+            args.input_apk,
+            extracted_apk_dir,
+            dex_dir,
+            have_locators=config_dict.get("emit_locator_strings"),
+            debug_mode=debug_mode,
+            fast_repackage=args.dev,
+            reset_timestamps=args.reset_zip_timestamps or args.dev,
+            is_bundle=is_bundle,
+        )
+        store_files = unpack_manager.__enter__()
+
+        lib_manager = LibraryManager(extracted_apk_dir, is_bundle=is_bundle)
+        lib_manager.__enter__()
+
+        if args.unpack_only:
+            print("APK: " + extracted_apk_dir)
+            print("DEX: " + dex_dir)
+            sys.exit()
+
+    # Unpack profiles, if they exist.
+    _handle_profiles(args)
+    _handle_secondary_method_profiles(args)
+
+    logging.debug("Moving contents to expected structure...")
+    # Move each dex to a separate temporary directory to be operated by
+    # redex.
+    dexen = move_dexen_to_directories(dex_dir, dex_glob(dex_dir))
+    for store in sorted(store_files):
+        dexen.append(store)
+    logging.debug(
+        "Unpacking APK finished in {:.2f} seconds".format(timer() - unpack_start_time)
+    )
+
+    if args.side_effect_summaries is not None:
+        args.passthru_json.append(
+            'ObjectSensitiveDcePass.side_effect_summaries="%s"'
+            % args.side_effect_summaries
+        )
+
+    if args.escape_summaries is not None:
+        args.passthru_json.append(
+            'ObjectSensitiveDcePass.escape_summaries="%s"' % args.escape_summaries
+        )
+
+    for key_value_str in args.passthru_json:
+        key_value = key_value_str.split("=", 1)
+        if len(key_value) != 2:
+            logging.debug(
+                "Json Pass through %s is not valid. Split len: %s",
+                key_value_str,
+                len(key_value),
+            )
+            continue
+        key = key_value[0]
+        value = key_value[1]
+        prev_value = config_dict.get(key, "(No previous value)")
+        logging.debug(
+            "Got Override %s = %s from %s. Previous %s",
+            key,
+            value,
+            key_value_str,
+            prev_value,
+        )
+        config_dict[key] = json.loads(value)
+
+    # Scan for framework files. If not found, warn and add them if available.
+    _check_android_sdk_api(args)
+    # Check for shrinker heuristics.
+    _check_shrinker_heuristics(args)
+
+    # Scan for SDK jar. If not found, warn and add if available.
+    _check_android_sdk(args)
+
+    logging.debug("Running redex-all on %d dex files ", len(dexen))
+    if args.lldb:
+        debugger = "lldb"
+    elif args.gdb:
+        debugger = "gdb"
+    else:
+        debugger = None
+
+    return State(
+        args=args,
+        config_dict=config_dict,
+        debugger=debugger,
+        dex_dir=dex_dir,
+        dexen=dexen,
+        extracted_apk_dir=extracted_apk_dir,
+        stop_pass_idx=stop_pass_idx,
+        lib_manager=lib_manager,
+        unpack_manager=unpack_manager,
+        zip_manager=zip_manager,
+    )
+
+
+def finalize_redex(state: State) -> None:
+    _assert_val(state.lib_manager).__exit__(*sys.exc_info())
 
     repack_start_time = timer()
 
-    log('Repacking dex files')
-    have_locators = config_dict.get("emit_locator_strings")
-    dex_mode.repackage(extracted_apk_dir, dex_dir, have_locators)
+    _assert_val(state.unpack_manager).__exit__(*sys.exc_info())
 
-    log('Creating output apk')
-    create_output_apk(extracted_apk_dir, args.out, args.sign, args.keystore,
-            args.keyalias, args.keypass)
-    log('Creating output APK finished in {:.2f} seconds'.format(
-            timer() - repack_start_time))
-    copy_stats_to_out_dir(newtmp, args.out)
-    copy_filename_map_to_out_dir(newtmp, args.out)
+    meta_file_dir = join(state.dex_dir, "meta/")
+    assert os.path.isdir(meta_file_dir), "meta dir %s does not exist" % meta_file_dir
 
-    if 'RenameClassesPass' in passes_list:
-        merge_proguard_map_with_rename_output(
-            args.input_apk,
-            args.out,
-            config_dict,
-            args.proguard_map)
-    else:
-        log('Skipping rename map merging, because we didn\'t run the rename pass')
+    resource_file_mapping = join(meta_file_dir, "resource-mapping.txt")
+    if os.path.exists(resource_file_mapping):
+        _assert_val(state.zip_manager).set_resource_file_mapping(resource_file_mapping)
+    _assert_val(state.zip_manager).__exit__(*sys.exc_info())
 
-    shutil.rmtree(newtmp)
+    align_and_sign_output_apk(
+        _assert_val(state.zip_manager).output_apk,
+        state.args.out,
+        # In dev mode, reset timestamps.
+        state.args.reset_zip_timestamps or state.args.dev,
+        state.args.sign,
+        state.args.keystore,
+        state.args.keyalias,
+        state.args.keypass,
+        state.args.ignore_zipalign,
+        state.args.page_align_libs,
+    )
+
+    logging.debug(
+        "Creating output APK finished in {:.2f} seconds".format(
+            timer() - repack_start_time
+        )
+    )
+
+    copy_all_file_to_out_dir(
+        meta_file_dir, state.args.out, "*", "all redex generated artifacts"
+    )
+
+    if state.args.enable_instrument_pass:
+        logging.debug("Creating redex-instrument-metadata.zip")
+        zipfile_path = join(dirname(state.args.out), "redex-instrument-metadata.zip")
+
+        FILES_MUST = [
+            join(dirname(state.args.out), f) for f in ("redex-instrument-metadata.txt",)
+        ]
+
+        FILES_MAY = [
+            join(dirname(state.args.out), f)
+            for f in (
+                "redex-source-block-method-dictionary.csv",
+                "redex-source-blocks.csv",
+            )
+        ]
+        FILES_ACTUALLY = [
+            *FILES_MUST,
+            *[f for f in FILES_MAY if os.path.exists(f)],
+        ]
+
+        # Write a checksum file.
+        hash = hashlib.md5()
+        for f in FILES_ACTUALLY:
+            hash.update(open(f, "rb").read())
+        checksum_path = join(dirname(state.args.out), "redex-instrument-checksum.txt")
+        with open(checksum_path, "w") as f:
+            f.write(f"{hash.hexdigest()}\n")
+
+        with zipfile.ZipFile(zipfile_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for f in [*FILES_ACTUALLY, checksum_path]:
+                z.write(f, os.path.basename(f))
+
+        for f in [*FILES_ACTUALLY, checksum_path]:
+            os.remove(f)
+
+    redex_stats_filename = state.config_dict.get("stats_output", "redex-stats.txt")
+    redex_stats_file = join(dirname(meta_file_dir), redex_stats_filename)
+    if isfile(redex_stats_file):
+        with open(redex_stats_file, "r") as fr:
+            apk_input_size = getsize(state.args.input_apk)
+            apk_output_size = getsize(state.args.out)
+            redex_stats_json = json.load(fr)
+            redex_stats_json["input_stats"]["total_stats"][
+                "num_compressed_apk_bytes"
+            ] = apk_input_size
+            redex_stats_json["output_stats"]["total_stats"][
+                "num_compressed_apk_bytes"
+            ] = apk_output_size
+            update_redex_stats_file = join(
+                dirname(state.args.out), redex_stats_filename
+            )
+            with open(update_redex_stats_file, "w") as fw:
+                json.dump(redex_stats_json, fw)
+
+    # Write invocation file
+    with open(join(dirname(state.args.out), "redex.py-invocation.txt"), "w") as f:
+        print("%s" % " ".join(map(shlex.quote, sys.argv)), file=f)
+
+    copy_all_file_to_out_dir(
+        state.dex_dir, state.args.out, "*.dot", "approximate shape graphs"
+    )
 
 
-if __name__ == '__main__':
-    keys = {}
+def _init_logging(level_str: str) -> None:
+    levels = {
+        "critical": logging.CRITICAL,
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "warning": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
+    }
+    level = levels[level_str]
+    logging.basicConfig(level=level)
+
+
+def run_redex_passthrough(
+    args: argparse.Namespace,
+    exception_formatter: ExceptionMessageFormatter,
+    output_line_handler: typing.Optional[typing.Callable[[str], str]],
+) -> None:
+    assert args.outdir
+    assert args.dex_files
+
+    state = State(
+        args=args,
+        config_dict={},
+        debugger=None,
+        dex_dir=args.outdir,
+        dexen=[],
+        extracted_apk_dir=None,
+        stop_pass_idx=-1,
+        lib_manager=None,
+        unpack_manager=None,
+        zip_manager=None,
+    )
+    run_redex_binary(state, exception_formatter, output_line_handler)
+
+
+def run_redex(
+    args: argparse.Namespace,
+    exception_formatter: typing.Optional[ExceptionMessageFormatter] = None,
+    output_line_handler: typing.Optional[typing.Callable[[str], str]] = None,
+) -> None:
+    # This is late, but hopefully early enough.
+    _init_logging(args.log_level)
+
+    with BuckConnectionScope():
+        if exception_formatter is None:
+            exception_formatter = ExceptionMessageFormatter()
+
+        if args.outdir or args.dex_files:
+            run_redex_passthrough(args, exception_formatter, output_line_handler)
+            return
+        else:
+            assert args.input_apk
+
+        with BuckPartScope("redex::Preparing", "Prepare to run redex"):
+            state = prepare_redex(args)
+
+        with BuckPartScope("redex::Run redex-all", "Actually run redex binary"):
+            run_redex_binary(state, exception_formatter, output_line_handler)
+
+        if args.stop_pass:
+            # Do not remove temp dirs
+            sys.exit()
+
+        finalize_redex(state)
+
+
+if __name__ == "__main__":
+    keys: typing.Dict[str, str] = {}
     try:
-        keystore = join(os.environ['HOME'], '.android', 'debug.keystore')
+        keystore: str = join(os.environ["HOME"], ".android", "debug.keystore")
         if isfile(keystore):
-            keys['keystore'] = keystore
-            keys['keyalias'] = 'androiddebugkey'
-            keys['keypass'] = 'android'
-    except:
+            keys["keystore"] = keystore
+            keys["keyalias"] = "androiddebugkey"
+            keys["keypass"] = "android"
+    except Exception:
         pass
-    args = arg_parser(**keys).parse_args()
-    run_redex(args)
+    args: argparse.Namespace = arg_parser(**keys).parse_args()
+    validate_args(args)
+    with_temp_cleanup(lambda: run_redex(args), args.always_clean_up)

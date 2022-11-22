@@ -1,10 +1,8 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "Warning.h"
@@ -12,7 +10,7 @@
 #include <cstdarg>
 #include <cstdio>
 
-OptWarningLevel g_warning_level = WARN_COUNT;
+OptWarningLevel g_warning_level = NO_WARN;
 
 const char* s_warning_text[] = {
 #define OPT_WARN(warn, str) str,
@@ -46,7 +44,7 @@ void print_warning_summary() {
     size_t count = s_warning_counts[i];
     if (count > 0) {
       fprintf(stderr,
-              "Optimization warning: %s: %lu occurrences\n",
+              "Optimization warning: %s: %zu occurrences\n",
               s_warning_text[i],
               count);
     }

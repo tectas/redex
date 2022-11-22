@@ -1,120 +1,159 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include <stdio.h>
 #include <unordered_set>
 
-#include "walkers.h"
-#include "ReachableClasses.h"
-#include "RemoveEmptyClasses.h"
 #include "DexClass.h"
 #include "DexUtil.h"
+#include "PassManager.h"
+#include "ReachableClasses.h"
+#include "RemoveEmptyClasses.h"
+#include "Trace.h"
+#include "Walkers.h"
+
+constexpr const char* METRIC_REMOVED_EMPTY_CLASSES =
+    "num_empty_classes_removed";
+
+void remove_clinit_if_trivial(DexClass* cls) {
+  DexMethod* clinit = cls->get_clinit();
+  if (clinit && method::is_trivial_clinit(*clinit->get_code())) {
+    cls->remove_method(clinit);
+  }
+}
 
 bool is_empty_class(DexClass* cls,
-                    std::unordered_set<const DexType*>& class_references) {
+                    ConcurrentSet<const DexType*>& class_references) {
   bool empty_class = cls->get_dmethods().empty() &&
-  cls->get_vmethods().empty() &&
-  cls->get_sfields().empty() &&
-  cls->get_ifields().empty();
+                     cls->get_vmethods().empty() &&
+                     cls->get_sfields().empty() && cls->get_ifields().empty();
   uint32_t access = cls->get_access();
   auto name = cls->get_type()->get_name()->c_str();
-  TRACE(EMPTY, 4, ">> Empty Analysis for %s\n", name);
-  TRACE(EMPTY, 4, "   no methods or fields: %d\n", empty_class);
-  TRACE(EMPTY, 4, "   can delete: %d\n", can_delete(cls));
-  TRACE(EMPTY, 4, "   !do not strip: %d\n", !do_not_strip(cls));
-  TRACE(EMPTY, 4, "   not interface: %d\n",
-      !(access & DexAccessFlags::ACC_INTERFACE));
-  TRACE(EMPTY, 4, "   references: %d\n",
-      class_references.count(cls->get_type()));
-  bool remove =
-         empty_class &&
-         can_delete(cls) &&
-         !do_not_strip(cls) &&
-         !(access & DexAccessFlags::ACC_INTERFACE) &&
-         class_references.count(cls->get_type()) == 0;
-  TRACE(EMPTY, 4, "   remove: %d\n", remove);
+  TRACE(EMPTY, 4, ">> Empty Analysis for %s", name);
+  TRACE(EMPTY, 4, "   no methods or fields: %d", empty_class);
+  TRACE(EMPTY, 4, "   can delete: %d", can_delete(cls));
+  TRACE(EMPTY, 4, "   not interface: %d",
+        !(access & DexAccessFlags::ACC_INTERFACE));
+  TRACE(EMPTY, 4, "   references: %zu",
+        class_references.count(cls->get_type()));
+  bool remove = empty_class && can_delete(cls) &&
+                !(access & DexAccessFlags::ACC_INTERFACE) &&
+                class_references.count(cls->get_type()) == 0;
+  TRACE(EMPTY, 4, "   remove: %d", remove);
   return remove;
 }
 
-void process_annotation(std::unordered_set<const DexType*>* class_references,
-  DexAnnotation* annotation) {
-    if (annotation->runtime_visible()) {
-      auto elements = annotation->anno_elems();
-      for (const DexAnnotationElement& element : elements) {
-        DexEncodedValue* evalue = element.encoded_value;
-        std::vector<DexType*> ltype;
-        evalue->gather_types(ltype);
-        for (DexType* dextype : ltype) {
-          TRACE(EMPTY, 4, "Adding type annotation to keep list: %s\n",
-                dextype->get_name()->c_str());
-          class_references->insert(dextype);
-        }
-      }
-    }
+void process_annotation(ConcurrentSet<const DexType*>* class_references,
+                        DexAnnotation* annotation) {
+  std::vector<DexType*> ltype;
+  annotation->gather_types(ltype);
+  for (DexType* dextype : ltype) {
+    TRACE(EMPTY, 4, "Adding type annotation to keep list: %s",
+          dextype->get_name()->c_str());
+    class_references->insert(dextype);
+  }
 }
 
-void process_code(std::unordered_set<const DexType*>* class_references,
-  DexMethod* meth, DexCode* code) {
-    auto opcodes = code->get_instructions();
-    for (const auto& opcode : opcodes) {
-      if (opcode->has_types()) {
-        auto typeop = static_cast<DexOpcodeType*>(opcode);
-        auto typ = typeop->get_type();
-        while (is_array(typ)) {
-          typ = get_array_type(typ);
-        }
-        TRACE(EMPTY, 4, "Adding type from code to keep list: %s\n",
-              typ->get_name()->c_str());
-        class_references->insert(typ);
-      }
-    }
-    // Also gather exception types that are caught.
-    std::vector<DexType*> catch_types;
-    code->gather_catch_types(catch_types);
-    for (auto&  caught_type : catch_types) {
-       class_references->insert(caught_type);
-    }
+void process_proto(ConcurrentSet<const DexType*>* class_references,
+                   DexMethodRef* meth) {
+  // Types referenced in protos.
+  auto const& proto = meth->get_proto();
+  class_references->insert(type::get_element_type_if_array(proto->get_rtype()));
+  for (auto const& ptype : *proto->get_args()) {
+    class_references->insert(type::get_element_type_if_array(ptype));
+  }
 }
 
-void remove_empty_classes(Scope& classes) {
+void process_code(ConcurrentSet<const DexType*>* class_references,
+                  DexMethod* meth,
+                  IRCode& code) {
+  // Types referenced in code.
+  for (auto const& mie : InstructionIterable(meth->get_code())) {
+    auto opcode = mie.insn;
+    if (opcode->has_type()) {
+      auto typ = type::get_element_type_if_array(opcode->get_type());
+      TRACE(EMPTY, 4, "Adding type from code to keep list: %s",
+            typ->get_name()->c_str());
+      class_references->insert(typ);
+    } else if (opcode->has_field()) {
+      auto const& field = opcode->get_field();
+      class_references->insert(
+          type::get_element_type_if_array(field->get_class()));
+      class_references->insert(
+          type::get_element_type_if_array(field->get_type()));
+    } else if (opcode->has_method()) {
+      auto const& m = opcode->get_method();
+      process_proto(class_references, m);
+    }
+  }
+  // Also gather exception types that are caught.
+  std::vector<DexType*> catch_types;
+  code.gather_catch_types(catch_types);
+  for (auto& caught_type : catch_types) {
+    class_references->insert(caught_type);
+  }
+}
+
+size_t remove_empty_classes(Scope& classes) {
 
   // class_references is a set of type names which represent classes
   // which should not be deleted even if they are deemed to be empty.
-  std::unordered_set<const DexType*> class_references;
+  ConcurrentSet<const DexType*> class_references;
 
-  walk_annotations(classes, [&](DexAnnotation* annotation)
-    { process_annotation(&class_references, annotation); });
+  walk::parallel::classes(classes, [&class_references](DexClass* cls) {
+    std::vector<DexClass*> singleton_cls{cls};
+    walk::annotations(singleton_cls, [&](DexAnnotation* annotation) {
+      process_annotation(&class_references, annotation);
+    });
 
-  walk_code(classes,
-            [](DexMethod*) { return true; },
-            [&](DexMethod* meth, DexCode* code)
-               { process_code (&class_references, meth, code); });
+    // Check the method protos and all the code.
+    walk::methods(singleton_cls, [&class_references](DexMethod* meth) {
+      process_proto(&class_references, meth);
+      auto code = meth->get_code();
+      if (!code) {
+        return;
+      }
+      process_code(&class_references, meth, *code);
+    });
 
-  size_t classes_before_size = classes.size();
-
-  // Ennumerate super classes.
-  for (auto& cls : classes) {
+    // Ennumerate super classes and remove trivial clinit if the class has any.
+    remove_clinit_if_trivial(cls);
     DexType* s = cls->get_super_class();
     class_references.insert(s);
-  }
 
-  TRACE(EMPTY, 3, "About to erase classes.\n");
+    // Ennumerate fields.
+    walk::fields(singleton_cls, [&class_references](DexField* field) {
+      class_references.insert(
+          type::get_element_type_if_array(field->get_type()));
+    });
+  });
+
+  size_t classes_before_size = classes.size();
+  TRACE(EMPTY, 3, "About to erase classes.");
   classes.erase(remove_if(classes.begin(), classes.end(),
-    [&](DexClass* cls) { return is_empty_class(cls, class_references); }),
-    classes.end());
+                          [&](DexClass* cls) {
+                            return is_empty_class(cls, class_references);
+                          }),
+                classes.end());
 
-  TRACE(EMPTY, 1, "Empty classes removed: %ld\n",
-    classes_before_size - classes.size());
+  auto num_classes_removed = classes_before_size - classes.size();
+  TRACE(EMPTY, 1, "Empty classes removed: %ld", num_classes_removed);
+  return num_classes_removed;
 }
 
-void RemoveEmptyClassesPass::run_pass(DexClassesVector& dexen, PgoFiles& pgo) {
-  auto scope = build_class_scope(dexen);
-  remove_empty_classes(scope);
-  post_dexen_changes(scope, dexen);
+void RemoveEmptyClassesPass::run_pass(DexStoresVector& stores,
+                                      ConfigFiles& /* conf */,
+                                      PassManager& mgr) {
+  auto scope = build_class_scope(stores);
+  auto num_empty_classes_removed = remove_empty_classes(scope);
+
+  mgr.incr_metric(METRIC_REMOVED_EMPTY_CLASSES, num_empty_classes_removed);
+
+  post_dexen_changes(scope, stores);
 }
+
+static RemoveEmptyClassesPass s_pass;

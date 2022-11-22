@@ -1,25 +1,39 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "Show.h"
 
-#include <sstream>
+#include <iomanip>
 
-#include "DexClass.h"
-#include "DexAnnotation.h"
-#include "DexOpcode.h"
-#include "DexDebugOpcode.h"
-#include "DexIdx.h"
+#include <boost/version.hpp>
+// Quoted was accepted into public components as of 1.73. The `detail`
+// header was removed in 1.74.
+#if BOOST_VERSION < 107400
+#include <boost/io/detail/quoted_manip.hpp>
+#else
+#include <boost/io/quoted.hpp>
+#endif
+
+#include "ControlFlow.h"
+#include "CppUtil.h"
 #include "Creators.h"
-#include "Transform.h"
+#include "DexAnnotation.h"
+#include "DexCallSite.h"
+#include "DexClass.h"
+#include "DexDebugInstruction.h"
+#include "DexIdx.h"
+#include "DexInstruction.h"
+#include "DexMethodHandle.h"
+#include "DexPosition.h"
 #include "DexUtil.h"
-
+#include "IRCode.h"
+#include "IROpcode.h"
+#include "ShowCFG.h"
+#include "StringBuilder.h"
 
 namespace {
 
@@ -38,24 +52,24 @@ std::string humanize(std::string const& type) {
     return "long";
   } else if (type.compare("S") == 0) {
     return "short";
+  } else if (type.compare("V") == 0) {
+    return "void";
   } else if (type.compare("Z") == 0) {
     return "boolean";
   } else if (type[0] == '[') {
-    std::stringstream ss;
+    std::ostringstream ss;
     ss << humanize(type.substr(1)) << "[]";
     return ss.str();
   } else if (type[0] == 'L') {
-    auto cls = type.substr(1, type.size() - 2);
-    std::replace(cls.begin(), cls.end(), '/', '.');
-    return cls;
+    return java_names::internal_to_external(type);
   }
-  return "unknonw";
+  return "unknown";
 }
 
 // TODO: make sure names reported handles collisions correctly.
 //       i.e. ACC_VOLATILE and ACC_BRIDGE etc.
 std::string accessibility(uint32_t acc, bool method = false) {
-  std::stringstream ss;
+  std::ostringstream ss;
   if (acc & DexAccessFlags::ACC_PUBLIC) {
     ss << "public ";
   }
@@ -109,592 +123,1020 @@ std::string show(DexAnnotationVisibility vis) {
   case DAV_SYSTEM:
     return "system";
   }
-  not_reached();
 }
 
-std::string show_opcode(const DexOpcode* op) {
-  if (!op) return "";
-  std::stringstream ss;
-  auto opcode = op->opcode();
+std::string show_type(const DexType* t, bool deobfuscated) {
+  return self_recursive_fn(
+      [&](auto self, const DexType* t) -> std::string {
+        if (t == nullptr) {
+          return std::string("");
+        }
+        auto name = t->get_name()->str();
+        if (!deobfuscated) {
+          return str_copy(name);
+        }
+        if (name[0] == 'L') {
+          auto cls = type_class(t);
+          if (cls != nullptr &&
+              !cls->get_deobfuscated_name_or_empty().empty()) {
+            return cls->get_deobfuscated_name_or_empty_copy();
+          }
+          return str_copy(name);
+        } else if (name[0] == '[') {
+          std::ostringstream ss;
+          ss << '[' << self(self, DexType::get_type(name.substr(1)));
+          return ss.str();
+        }
+        return str_copy(name);
+      },
+      t);
+}
+
+std::string show_field(const DexFieldRef* ref, bool deobfuscated) {
+  if (ref == nullptr) {
+    return "";
+  }
+
+  if (deobfuscated && ref->is_def()) {
+    const auto name = ref->as_def()->get_deobfuscated_name_or_empty();
+    if (!name.empty()) {
+      return str_copy(name);
+    }
+  }
+  string_builders::StaticStringBuilder<5> b;
+  b << show_type(ref->get_class(), deobfuscated) << "." << show(ref->get_name())
+    << ":" << show_type(ref->get_type(), deobfuscated);
+  return b.str();
+}
+
+std::string show_type_list(const DexTypeList* l, bool deobfuscated) {
+  if (l == nullptr) {
+    return "";
+  }
+
+  string_builders::DynamicStringBuilder b(l->size());
+  for (const auto& type : *l) {
+    b << show_type(type, deobfuscated);
+  }
+  return b.str();
+}
+
+std::string show_proto(const DexProto* p, bool deobfuscated) {
+  if (p == nullptr) {
+    return "";
+  }
+  string_builders::StaticStringBuilder<4> b;
+  b << "(" << show_type_list(p->get_args(), deobfuscated) << ")"
+    << show_type(p->get_rtype(), deobfuscated);
+  return b.str();
+}
+
+std::string show_method(const DexMethodRef* ref, bool deobfuscated) {
+  if (ref == nullptr) {
+    return "";
+  }
+
+  if (deobfuscated && ref->is_def()) {
+    const auto name = ref->as_def()->get_deobfuscated_name_or_empty();
+    if (!name.empty()) {
+      return str_copy(name);
+    }
+  }
+
+  string_builders::StaticStringBuilder<5> b;
+  b << show_type(ref->get_class(), deobfuscated) << "." << show(ref->get_name())
+    << ":" << show_proto(ref->get_proto(), deobfuscated);
+  return b.str();
+}
+
+std::string show_methodhandle(const DexMethodHandle* ref, bool deobfuscated) {
+  if (ref == nullptr) {
+    return "";
+  }
+  return show_method(ref->methodref(), deobfuscated);
+}
+
+std::string show_opcode(const DexInstruction* insn, bool deobfuscated = false) {
+  if (!insn) return "";
+  std::ostringstream ss;
+  auto opcode = insn->opcode();
   switch (opcode) {
-  case OPCODE_NOP:
+  case DOPCODE_NOP:
     return "nop";
-  case OPCODE_MOVE:
+  case DOPCODE_MOVE:
     return "move";
-  case OPCODE_MOVE_WIDE:
+  case DOPCODE_MOVE_WIDE:
     return "move-wide";
-  case OPCODE_MOVE_OBJECT:
+  case DOPCODE_MOVE_OBJECT:
     return "move-object";
-  case OPCODE_MOVE_RESULT:
+  case DOPCODE_MOVE_RESULT:
     return "move-result";
-  case OPCODE_MOVE_RESULT_WIDE:
+  case DOPCODE_MOVE_RESULT_WIDE:
     return "move-result-wide";
-  case OPCODE_MOVE_RESULT_OBJECT:
+  case DOPCODE_MOVE_RESULT_OBJECT:
     return "move-result-object";
-  case OPCODE_MOVE_EXCEPTION:
+  case DOPCODE_MOVE_EXCEPTION:
     return "move-exception";
-  case OPCODE_RETURN_VOID:
+  case DOPCODE_RETURN_VOID:
     return "return-void";
-  case OPCODE_RETURN:
+  case DOPCODE_RETURN:
     return "return";
-  case OPCODE_RETURN_WIDE:
+  case DOPCODE_RETURN_WIDE:
     return "return-wide";
-  case OPCODE_RETURN_OBJECT:
+  case DOPCODE_RETURN_OBJECT:
     return "return-object";
-  case OPCODE_CONST_4:
+  case DOPCODE_CONST_4:
     return "const/4";
-  case OPCODE_MONITOR_ENTER:
+  case DOPCODE_MONITOR_ENTER:
     return "monitor-enter";
-  case OPCODE_MONITOR_EXIT:
+  case DOPCODE_MONITOR_EXIT:
     return "monitor-exit";
-  case OPCODE_THROW:
+  case DOPCODE_THROW:
     return "throw";
-  case OPCODE_GOTO:
+  case DOPCODE_GOTO:
     return "goto";
-  case OPCODE_NEG_INT:
+  case DOPCODE_NEG_INT:
     return "neg-int";
-  case OPCODE_NOT_INT:
+  case DOPCODE_NOT_INT:
     return "not-int";
-  case OPCODE_NEG_LONG:
+  case DOPCODE_NEG_LONG:
     return "neg-long";
-  case OPCODE_NOT_LONG:
+  case DOPCODE_NOT_LONG:
     return "not-long";
-  case OPCODE_NEG_FLOAT:
+  case DOPCODE_NEG_FLOAT:
     return "neg-float";
-  case OPCODE_NEG_DOUBLE:
+  case DOPCODE_NEG_DOUBLE:
     return "neg-double";
-  case OPCODE_INT_TO_LONG:
+  case DOPCODE_INT_TO_LONG:
     return "int-to-long";
-  case OPCODE_INT_TO_FLOAT:
+  case DOPCODE_INT_TO_FLOAT:
     return "int-to-float";
-  case OPCODE_INT_TO_DOUBLE:
+  case DOPCODE_INT_TO_DOUBLE:
     return "int-to-double";
-  case OPCODE_LONG_TO_INT:
+  case DOPCODE_LONG_TO_INT:
     return "long-to-int";
-  case OPCODE_LONG_TO_FLOAT:
+  case DOPCODE_LONG_TO_FLOAT:
     return "long-to-float";
-  case OPCODE_LONG_TO_DOUBLE:
+  case DOPCODE_LONG_TO_DOUBLE:
     return "long-to-double";
-  case OPCODE_FLOAT_TO_INT:
+  case DOPCODE_FLOAT_TO_INT:
     return "float-to-int";
-  case OPCODE_FLOAT_TO_LONG:
+  case DOPCODE_FLOAT_TO_LONG:
     return "float-to-long";
-  case OPCODE_FLOAT_TO_DOUBLE:
+  case DOPCODE_FLOAT_TO_DOUBLE:
     return "float-to-double";
-  case OPCODE_DOUBLE_TO_INT:
+  case DOPCODE_DOUBLE_TO_INT:
     return "double-to-int";
-  case OPCODE_DOUBLE_TO_LONG:
+  case DOPCODE_DOUBLE_TO_LONG:
     return "double-to-long";
-  case OPCODE_DOUBLE_TO_FLOAT:
+  case DOPCODE_DOUBLE_TO_FLOAT:
     return "double-to-float";
-  case OPCODE_INT_TO_BYTE:
+  case DOPCODE_INT_TO_BYTE:
     return "int-to-byte";
-  case OPCODE_INT_TO_CHAR:
+  case DOPCODE_INT_TO_CHAR:
     return "int-to-char";
-  case OPCODE_INT_TO_SHORT:
+  case DOPCODE_INT_TO_SHORT:
     return "int-to-short";
-  case OPCODE_ADD_INT_2ADDR:
-    return "add-int/2addr";
-  case OPCODE_SUB_INT_2ADDR:
-    return "sub-int/2addr";
-  case OPCODE_MUL_INT_2ADDR:
-    return "mul-int/2addr";
-  case OPCODE_DIV_INT_2ADDR:
-    return "div-int/2addr";
-  case OPCODE_REM_INT_2ADDR:
-    return "rem-int/2addr";
-  case OPCODE_AND_INT_2ADDR:
-    return "and-int/2addr";
-  case OPCODE_OR_INT_2ADDR:
-    return "or-int/2addr";
-  case OPCODE_XOR_INT_2ADDR:
-    return "xor-int/2addr";
-  case OPCODE_SHL_INT_2ADDR:
-    return "shl-int/2addr";
-  case OPCODE_SHR_INT_2ADDR:
-    return "shr-int/2addr";
-  case OPCODE_USHR_INT_2ADDR:
-    return "ushr-int/2addr";
-  case OPCODE_ADD_LONG_2ADDR:
-    return "add-long/2addr";
-  case OPCODE_SUB_LONG_2ADDR:
-    return "sub-long/2addr";
-  case OPCODE_MUL_LONG_2ADDR:
-    return "mul-long/2addr";
-  case OPCODE_DIV_LONG_2ADDR:
-    return "div-long/2addr";
-  case OPCODE_REM_LONG_2ADDR:
-    return "rem-long/2addr";
-  case OPCODE_AND_LONG_2ADDR:
-    return "and-long/2addr";
-  case OPCODE_OR_LONG_2ADDR:
-    return "or-long/2addr";
-  case OPCODE_XOR_LONG_2ADDR:
-    return "xor-long/2addr";
-  case OPCODE_SHL_LONG_2ADDR:
-    return "shl-long/2addr";
-  case OPCODE_SHR_LONG_2ADDR:
-    return "shr-long/2addr";
-  case OPCODE_USHR_LONG_2ADDR:
-    return "ushr-long/2addr";
-  case OPCODE_ADD_FLOAT_2ADDR:
-    return "add-float/2addr";
-  case OPCODE_SUB_FLOAT_2ADDR:
-    return "sub-float/2addr";
-  case OPCODE_MUL_FLOAT_2ADDR:
-    return "mul-float/2addr";
-  case OPCODE_DIV_FLOAT_2ADDR:
-    return "div-float/2addr";
-  case OPCODE_REM_FLOAT_2ADDR:
-    return "rem-float/2addr";
-  case OPCODE_ADD_DOUBLE_2ADDR:
-    return "add-double/2addr";
-  case OPCODE_SUB_DOUBLE_2ADDR:
-    return "sub-double/2addr";
-  case OPCODE_MUL_DOUBLE_2ADDR:
-    return "mul-double/2addr";
-  case OPCODE_DIV_DOUBLE_2ADDR:
-    return "div-double/2addr";
-  case OPCODE_REM_DOUBLE_2ADDR:
-    return "rem-double/2addr";
-  case OPCODE_ARRAY_LENGTH:
+  case DOPCODE_ARRAY_LENGTH:
     return "array-length";
-  case OPCODE_MOVE_FROM16:
+  case DOPCODE_MOVE_FROM16:
     return "move/from16";
-  case OPCODE_MOVE_WIDE_FROM16:
+  case DOPCODE_MOVE_WIDE_FROM16:
     return "move-wide/from16";
-  case OPCODE_MOVE_OBJECT_FROM16:
+  case DOPCODE_MOVE_OBJECT_FROM16:
     return "move-object/from16";
-  case OPCODE_CONST_16:
+  case DOPCODE_CONST_16:
     return "const/16";
-  case OPCODE_CONST_HIGH16:
+  case DOPCODE_CONST_HIGH16:
     return "const/high16";
-  case OPCODE_CONST_WIDE_16:
+  case DOPCODE_CONST_WIDE_16:
     return "const-wide/16";
-  case OPCODE_CONST_WIDE_HIGH16:
+  case DOPCODE_CONST_WIDE_HIGH16:
     return "const-wide/high16";
-  case OPCODE_GOTO_16:
+  case DOPCODE_GOTO_16:
     return "goto/16";
-  case OPCODE_CMPL_FLOAT:
-    return "cpml-float";
-  case OPCODE_CMPG_FLOAT:
-    return "cpmg-float";
-  case OPCODE_CMPL_DOUBLE:
-    return "cpml-double";
-  case OPCODE_CMPG_DOUBLE:
-    return "cpmg-double";
-  case OPCODE_CMP_LONG:
-    return "cpm-long";
-  case OPCODE_IF_EQ:
+  case DOPCODE_CMPL_FLOAT:
+    return "cmpl-float";
+  case DOPCODE_CMPG_FLOAT:
+    return "cmpg-float";
+  case DOPCODE_CMPL_DOUBLE:
+    return "cmpl-double";
+  case DOPCODE_CMPG_DOUBLE:
+    return "cmpg-double";
+  case DOPCODE_CMP_LONG:
+    return "cmp-long";
+  case DOPCODE_IF_EQ:
     return "if-eq";
-  case OPCODE_IF_NE:
+  case DOPCODE_IF_NE:
     return "if-ne";
-  case OPCODE_IF_LT:
+  case DOPCODE_IF_LT:
     return "if-lt";
-  case OPCODE_IF_GE:
+  case DOPCODE_IF_GE:
     return "if-ge";
-  case OPCODE_IF_GT:
+  case DOPCODE_IF_GT:
     return "if-gt";
-  case OPCODE_IF_LE:
+  case DOPCODE_IF_LE:
     return "if-le";
-  case OPCODE_IF_EQZ:
+  case DOPCODE_IF_EQZ:
     return "if-eqz";
-  case OPCODE_IF_NEZ:
+  case DOPCODE_IF_NEZ:
     return "if-nez";
-  case OPCODE_IF_LTZ:
+  case DOPCODE_IF_LTZ:
     return "if-ltz";
-  case OPCODE_IF_GEZ:
+  case DOPCODE_IF_GEZ:
     return "if-gez";
-  case OPCODE_IF_GTZ:
+  case DOPCODE_IF_GTZ:
     return "if-gtz";
-  case OPCODE_IF_LEZ:
+  case DOPCODE_IF_LEZ:
     return "if-lez";
-  case OPCODE_AGET:
+  case DOPCODE_AGET:
     return "aget";
-  case OPCODE_AGET_WIDE:
+  case DOPCODE_AGET_WIDE:
     return "aget-wide";
-  case OPCODE_AGET_OBJECT:
+  case DOPCODE_AGET_OBJECT:
     return "aget-object";
-  case OPCODE_AGET_BOOLEAN:
+  case DOPCODE_AGET_BOOLEAN:
     return "aget-boolean";
-  case OPCODE_AGET_BYTE:
+  case DOPCODE_AGET_BYTE:
     return "aget-byte";
-  case OPCODE_AGET_CHAR:
+  case DOPCODE_AGET_CHAR:
     return "aget-char";
-  case OPCODE_AGET_SHORT:
+  case DOPCODE_AGET_SHORT:
     return "aget-short";
-  case OPCODE_APUT:
+  case DOPCODE_APUT:
     return "aput";
-  case OPCODE_APUT_WIDE:
+  case DOPCODE_APUT_WIDE:
     return "aput-wide";
-  case OPCODE_APUT_OBJECT:
+  case DOPCODE_APUT_OBJECT:
     return "aput-object";
-  case OPCODE_APUT_BOOLEAN:
+  case DOPCODE_APUT_BOOLEAN:
     return "aput-boolean";
-  case OPCODE_APUT_BYTE:
+  case DOPCODE_APUT_BYTE:
     return "aput-byte";
-  case OPCODE_APUT_CHAR:
+  case DOPCODE_APUT_CHAR:
     return "aput-char";
-  case OPCODE_APUT_SHORT:
+  case DOPCODE_APUT_SHORT:
     return "aput-short";
-  case OPCODE_ADD_INT:
+  case DOPCODE_ADD_INT:
     return "add-int";
-  case OPCODE_SUB_INT:
+  case DOPCODE_SUB_INT:
     return "sub-int";
-  case OPCODE_MUL_INT:
+  case DOPCODE_MUL_INT:
     return "mul-int";
-  case OPCODE_DIV_INT:
+  case DOPCODE_DIV_INT:
     return "div-int";
-  case OPCODE_REM_INT:
+  case DOPCODE_REM_INT:
     return "rem-int";
-  case OPCODE_AND_INT:
+  case DOPCODE_AND_INT:
     return "and-int";
-  case OPCODE_OR_INT:
+  case DOPCODE_OR_INT:
     return "or-int";
-  case OPCODE_XOR_INT:
+  case DOPCODE_XOR_INT:
     return "xor-int";
-  case OPCODE_SHL_INT:
+  case DOPCODE_SHL_INT:
     return "shl-int";
-  case OPCODE_SHR_INT:
+  case DOPCODE_SHR_INT:
     return "shr-int";
-  case OPCODE_USHR_INT:
+  case DOPCODE_USHR_INT:
     return "ushr-int";
-  case OPCODE_ADD_LONG:
+  case DOPCODE_ADD_LONG:
     return "add-long";
-  case OPCODE_SUB_LONG:
+  case DOPCODE_SUB_LONG:
     return "sub-long";
-  case OPCODE_MUL_LONG:
+  case DOPCODE_MUL_LONG:
     return "mul-long";
-  case OPCODE_DIV_LONG:
+  case DOPCODE_DIV_LONG:
     return "div-long";
-  case OPCODE_REM_LONG:
+  case DOPCODE_REM_LONG:
     return "rem-long";
-  case OPCODE_AND_LONG:
+  case DOPCODE_AND_LONG:
     return "and-long";
-  case OPCODE_OR_LONG:
+  case DOPCODE_OR_LONG:
     return "or-long";
-  case OPCODE_XOR_LONG:
+  case DOPCODE_XOR_LONG:
     return "xor-long";
-  case OPCODE_SHL_LONG:
+  case DOPCODE_SHL_LONG:
     return "shl-long";
-  case OPCODE_SHR_LONG:
+  case DOPCODE_SHR_LONG:
     return "shr-long";
-  case OPCODE_USHR_LONG:
+  case DOPCODE_USHR_LONG:
     return "ushr-long";
-  case OPCODE_ADD_FLOAT:
+  case DOPCODE_ADD_FLOAT:
     return "add-float";
-  case OPCODE_SUB_FLOAT:
+  case DOPCODE_SUB_FLOAT:
     return "sub-float";
-  case OPCODE_MUL_FLOAT:
+  case DOPCODE_MUL_FLOAT:
     return "mul-float";
-  case OPCODE_DIV_FLOAT:
+  case DOPCODE_DIV_FLOAT:
     return "div-float";
-  case OPCODE_REM_FLOAT:
+  case DOPCODE_REM_FLOAT:
     return "rem-float";
-  case OPCODE_ADD_DOUBLE:
+  case DOPCODE_ADD_DOUBLE:
     return "add-double";
-  case OPCODE_SUB_DOUBLE:
+  case DOPCODE_SUB_DOUBLE:
     return "sub-double";
-  case OPCODE_MUL_DOUBLE:
+  case DOPCODE_MUL_DOUBLE:
     return "mul-double";
-  case OPCODE_DIV_DOUBLE:
+  case DOPCODE_DIV_DOUBLE:
     return "div-double";
-  case OPCODE_REM_DOUBLE:
+  case DOPCODE_REM_DOUBLE:
     return "rem-double";
-  case OPCODE_ADD_INT_LIT16:
+  case DOPCODE_ADD_INT_LIT16:
     return "add-int/lit16";
-  case OPCODE_RSUB_INT:
+  case DOPCODE_RSUB_INT:
     return "rsub-int";
-  case OPCODE_MUL_INT_LIT16:
+  case DOPCODE_MUL_INT_LIT16:
     return "mul-int/lit16";
-  case OPCODE_DIV_INT_LIT16:
+  case DOPCODE_DIV_INT_LIT16:
     return "div-int/lit16";
-  case OPCODE_REM_INT_LIT16:
+  case DOPCODE_REM_INT_LIT16:
     return "rem-int/lit16";
-  case OPCODE_AND_INT_LIT16:
+  case DOPCODE_AND_INT_LIT16:
     return "and-int/lit16";
-  case OPCODE_OR_INT_LIT16:
+  case DOPCODE_OR_INT_LIT16:
     return "or-int/lit16";
-  case OPCODE_XOR_INT_LIT16:
+  case DOPCODE_XOR_INT_LIT16:
     return "xor-int/lit16";
-  case OPCODE_ADD_INT_LIT8:
+  case DOPCODE_ADD_INT_LIT8:
     return "add-int/lit8";
-  case OPCODE_RSUB_INT_LIT8:
+  case DOPCODE_RSUB_INT_LIT8:
     return "rsub-int/lit8";
-  case OPCODE_MUL_INT_LIT8:
+  case DOPCODE_MUL_INT_LIT8:
     return "mul-int/lit8";
-  case OPCODE_DIV_INT_LIT8:
+  case DOPCODE_DIV_INT_LIT8:
     return "div-int/lit8";
-  case OPCODE_REM_INT_LIT8:
+  case DOPCODE_REM_INT_LIT8:
     return "rem-int/lit8";
-  case OPCODE_AND_INT_LIT8:
+  case DOPCODE_AND_INT_LIT8:
     return "and-int/lit8";
-  case OPCODE_OR_INT_LIT8:
+  case DOPCODE_OR_INT_LIT8:
     return "or-int/lit8";
-  case OPCODE_XOR_INT_LIT8:
+  case DOPCODE_XOR_INT_LIT8:
     return "xor-int/lit8";
-  case OPCODE_SHL_INT_LIT8:
+  case DOPCODE_SHL_INT_LIT8:
     return "shl-int/lit8";
-  case OPCODE_SHR_INT_LIT8:
+  case DOPCODE_SHR_INT_LIT8:
     return "shr-int/lit8";
-  case OPCODE_USHR_INT_LIT8:
+  case DOPCODE_USHR_INT_LIT8:
     return "ushr-int/lit8";
-  case OPCODE_MOVE_16:
+  case DOPCODE_MOVE_16:
     return "move/16";
-  case OPCODE_MOVE_WIDE_16:
+  case DOPCODE_MOVE_WIDE_16:
     return "move-wide/16";
-  case OPCODE_MOVE_OBJECT_16:
+  case DOPCODE_MOVE_OBJECT_16:
     return "move-object/16";
-  case OPCODE_CONST:
+  case DOPCODE_CONST:
     return "const";
-  case OPCODE_CONST_WIDE_32:
+  case DOPCODE_CONST_WIDE_32:
     return "const-wide/32";
-  case OPCODE_FILL_ARRAY_DATA:
+  case DOPCODE_FILL_ARRAY_DATA:
     return "fill-array-data";
-  case OPCODE_GOTO_32:
+  case DOPCODE_GOTO_32:
     return "goto/32";
-  case OPCODE_PACKED_SWITCH:
+  case DOPCODE_PACKED_SWITCH:
     return "packed-switch";
-  case OPCODE_SPARSE_SWITCH:
+  case DOPCODE_SPARSE_SWITCH:
     return "sparse-switch";
-  case OPCODE_CONST_WIDE:
+  case DOPCODE_CONST_WIDE:
     return "const-wide";
   // field opcode
-  case OPCODE_IGET:
-    ss << "iget " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IGET:
+    ss << "iget ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IGET_WIDE:
-    ss << "iget-wide " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IGET_WIDE:
+    ss << "iget-wide ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IGET_OBJECT:
-    ss << "iget-object " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IGET_OBJECT:
+    ss << "iget-object ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IGET_BOOLEAN:
-    ss << "iget-boolean " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IGET_BOOLEAN:
+    ss << "iget-boolean ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IGET_BYTE:
-    ss << "iget-byte " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IGET_BYTE:
+    ss << "iget-byte ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IGET_CHAR:
-    ss << "iget-char " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IGET_CHAR:
+    ss << "iget-char ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IGET_SHORT:
-    ss << "iget-short " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IGET_SHORT:
+    ss << "iget-short ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IPUT:
-    ss << "iput " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IPUT:
+    ss << "iput ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IPUT_WIDE:
-    ss << "iput-wide " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IPUT_WIDE:
+    ss << "iput-wide ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IPUT_OBJECT:
-    ss << "iput-object " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IPUT_OBJECT:
+    ss << "iput-object ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IPUT_BOOLEAN:
-    ss << "iput-boolean " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IPUT_BOOLEAN:
+    ss << "iput-boolean ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IPUT_BYTE:
-    ss << "iput-byte " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IPUT_BYTE:
+    ss << "iput-byte ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IPUT_CHAR:
-    ss << "iput-char " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IPUT_CHAR:
+    ss << "iput-char ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_IPUT_SHORT:
-    ss << "iput-short " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_IPUT_SHORT:
+    ss << "iput-short ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SGET:
-    ss << "sget " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SGET:
+    ss << "sget ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SGET_WIDE:
-    ss << "sget-wide " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SGET_WIDE:
+    ss << "sget-wide ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SGET_OBJECT:
-    ss << "sget-object " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SGET_OBJECT:
+    ss << "sget-object ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SGET_BOOLEAN:
-    ss << "sget-boolean " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SGET_BOOLEAN:
+    ss << "sget-boolean ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SGET_BYTE:
-    ss << "sget-byte " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SGET_BYTE:
+    ss << "sget-byte ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SGET_CHAR:
-    ss << "sget-char " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SGET_CHAR:
+    ss << "sget-char ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SGET_SHORT:
-    ss << "sget-short " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SGET_SHORT:
+    ss << "sget-short ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SPUT:
-    ss << "sput " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SPUT:
+    ss << "sput ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SPUT_WIDE:
-    ss << "sput-wide " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SPUT_WIDE:
+    ss << "sput-wide ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SPUT_OBJECT:
-    ss << "sput-object " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SPUT_OBJECT:
+    ss << "sput-object ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SPUT_BOOLEAN:
-    ss << "sput-boolean " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SPUT_BOOLEAN:
+    ss << "sput-boolean ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SPUT_BYTE:
-    ss << "sput-byte " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SPUT_BYTE:
+    ss << "sput-byte ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SPUT_CHAR:
-    ss << "sput-char " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SPUT_CHAR:
+    ss << "sput-char ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_SPUT_SHORT:
-    ss << "sput-short " << show(((DexOpcodeField*)op)->field());
+  case DOPCODE_SPUT_SHORT:
+    ss << "sput-short ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_VIRTUAL:
-    ss << "invoke-virtual " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_VIRTUAL:
+    ss << "invoke-virtual ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_SUPER:
-    ss << "invoke-super " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_SUPER:
+    ss << "invoke-super ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_DIRECT:
-    ss << "invoke-direct " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_DIRECT:
+    ss << "invoke-direct ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_STATIC:
-    ss << "invoke-static " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_STATIC:
+    ss << "invoke-static ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_INTERFACE:
-    ss << "invoke-interface " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_INTERFACE:
+    ss << "invoke-interface ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_VIRTUAL_RANGE:
-    ss << "invoke-virtual/range " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_VIRTUAL_RANGE:
+    ss << "invoke-virtual/range ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_SUPER_RANGE:
-    ss << "invoke-super/range " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_SUPER_RANGE:
+    ss << "invoke-super/range ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_DIRECT_RANGE:
-    ss << "invoke-direct/range " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_DIRECT_RANGE:
+    ss << "invoke-direct/range ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_STATIC_RANGE:
-    ss << "invoke-static/range " << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_STATIC_RANGE:
+    ss << "invoke-static/range ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_INVOKE_INTERFACE_RANGE:
-    ss << "invoke-interface/range "
-       << show(((DexOpcodeMethod*)op)->get_method());
+  case DOPCODE_INVOKE_INTERFACE_RANGE:
+    ss << "invoke-interface/range ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
     return ss.str();
-  case OPCODE_CONST_STRING:
-    ss << "const-string " << show(((DexOpcodeString*)op)->get_string());
+  case DOPCODE_CONST_STRING:
+    ss << "const-string "
+       << show(static_cast<const DexOpcodeString*>(insn)->get_string());
     return ss.str();
-  case OPCODE_CONST_STRING_JUMBO:
-    ss << "const-string/jumbo " << show(((DexOpcodeString*)op)->get_string());
+  case DOPCODE_CONST_STRING_JUMBO:
+    ss << "const-string/jumbo "
+       << show(static_cast<const DexOpcodeString*>(insn)->get_string());
     return ss.str();
-  case OPCODE_CONST_CLASS:
-    ss << "const-class " << show(((DexOpcodeType*)op)->get_type());
+  case DOPCODE_CONST_CLASS:
+    ss << "const-class ";
+    ss << show_type(static_cast<const DexOpcodeType*>(insn)->get_type(),
+                    deobfuscated);
     return ss.str();
-  case OPCODE_CHECK_CAST:
-    ss << "check-cast " << show(((DexOpcodeType*)op)->get_type());
+  case DOPCODE_CHECK_CAST:
+    ss << "check-cast ";
+    ss << show_type(static_cast<const DexOpcodeType*>(insn)->get_type(),
+                    deobfuscated);
     return ss.str();
-  case OPCODE_INSTANCE_OF:
-    ss << "instance-of " << show(((DexOpcodeType*)op)->get_type());
+  case DOPCODE_INSTANCE_OF:
+    ss << "instance-of ";
+    ss << show_type(static_cast<const DexOpcodeType*>(insn)->get_type(),
+                    deobfuscated);
     return ss.str();
-  case OPCODE_NEW_INSTANCE:
-    ss << "new-instance " << show(((DexOpcodeType*)op)->get_type());
+  case DOPCODE_NEW_INSTANCE:
+    ss << "new-instance ";
+    ss << show_type(static_cast<const DexOpcodeType*>(insn)->get_type(),
+                    deobfuscated);
     return ss.str();
-  case OPCODE_NEW_ARRAY:
-    ss << "new-array " << show(((DexOpcodeType*)op)->get_type());
+  case DOPCODE_NEW_ARRAY:
+    ss << "new-array ";
+    ss << show_type(static_cast<const DexOpcodeType*>(insn)->get_type(),
+                    deobfuscated);
     return ss.str();
-  case OPCODE_FILLED_NEW_ARRAY:
-    ss << "filled-new-array " << show(((DexOpcodeType*)op)->get_type());
-    return ss.str();
-  case OPCODE_FILLED_NEW_ARRAY_RANGE:
-    ss << "filled-new-array/range " << show(((DexOpcodeType*)op)->get_type());
+  case DOPCODE_FILLED_NEW_ARRAY:
+    ss << "filled-new-array ";
+    ss << show_type(static_cast<const DexOpcodeType*>(insn)->get_type(),
+                    deobfuscated);
     return ss.str();
   case FOPCODE_PACKED_SWITCH:
-    ss << "packed-switch";
-    return ss.str();
+    return "packed-switch-payload";
   case FOPCODE_SPARSE_SWITCH:
-    ss << "sparse-switch";
-    return ss.str();
+    return "sparse-switch-payload";
   case FOPCODE_FILLED_ARRAY:
-    ss << "filled-array";
+    return "fill-array-data-payload";
+  case DOPCODE_FILLED_NEW_ARRAY_RANGE:
+    return "filled-new-array/range";
+  case DOPCODE_RETURN_VOID_NO_BARRIER:
+    return "return-void-no-barrier";
+  case DOPCODE_ADD_INT_2ADDR:
+    return "add-int/2addr";
+  case DOPCODE_SUB_INT_2ADDR:
+    return "sub-int/2addr";
+  case DOPCODE_MUL_INT_2ADDR:
+    return "mult-int/2addr";
+  case DOPCODE_DIV_INT_2ADDR:
+    return "div-int/2addr";
+  case DOPCODE_REM_INT_2ADDR:
+    return "rem-int/2addr";
+  case DOPCODE_AND_INT_2ADDR:
+    return "and-int/2addr";
+  case DOPCODE_OR_INT_2ADDR:
+    return "or-int/2addr";
+  case DOPCODE_XOR_INT_2ADDR:
+    return "xor-int/2addr";
+  case DOPCODE_SHL_INT_2ADDR:
+    return "shl-int/2addr";
+  case DOPCODE_SHR_INT_2ADDR:
+    return "shr-int/2addr";
+  case DOPCODE_USHR_INT_2ADDR:
+    return "ushr-int/2addr";
+  case DOPCODE_ADD_LONG_2ADDR:
+    return "add-long/2addr";
+  case DOPCODE_SUB_LONG_2ADDR:
+    return "sub-long/2addr";
+  case DOPCODE_MUL_LONG_2ADDR:
+    return "mul-long/2addr";
+  case DOPCODE_DIV_LONG_2ADDR:
+    return "div-long/2addr";
+  case DOPCODE_REM_LONG_2ADDR:
+    return "rem-long/2addr";
+  case DOPCODE_AND_LONG_2ADDR:
+    return "and-long/2addr";
+  case DOPCODE_OR_LONG_2ADDR:
+    return "or-long/2addr";
+  case DOPCODE_XOR_LONG_2ADDR:
+    return "xor-long/2addr";
+  case DOPCODE_SHL_LONG_2ADDR:
+    return "shl-long/2addr";
+  case DOPCODE_SHR_LONG_2ADDR:
+    return "shr-long/2addr";
+  case DOPCODE_USHR_LONG_2ADDR:
+    return "ushr-long/2addr";
+  case DOPCODE_ADD_FLOAT_2ADDR:
+    return "add-float/2addr";
+  case DOPCODE_SUB_FLOAT_2ADDR:
+    return "sub-float/2addr";
+  case DOPCODE_MUL_FLOAT_2ADDR:
+    return "mul-float/2addr";
+  case DOPCODE_DIV_FLOAT_2ADDR:
+    return "div-float/2addr";
+  case DOPCODE_REM_FLOAT_2ADDR:
+    return "rem-float/2addr";
+  case DOPCODE_ADD_DOUBLE_2ADDR:
+    return "add-double/2addr";
+  case DOPCODE_SUB_DOUBLE_2ADDR:
+    return "sub-double/2addr";
+  case DOPCODE_MUL_DOUBLE_2ADDR:
+    return "mul-double/2addr";
+  case DOPCODE_DIV_DOUBLE_2ADDR:
+    return "div-double/2addr";
+  case DOPCODE_REM_DOUBLE_2ADDR:
+    return "rem-double/2addr";
+  case DOPCODE_IGET_QUICK:
+    return "add-double/2addr";
+  case DOPCODE_IGET_WIDE_QUICK:
+    ss << "iget-wide-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
     return ss.str();
-  default:
-    return "unknown_op_code";
+  case DOPCODE_IGET_OBJECT_QUICK:
+    ss << "iget-object-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IPUT_QUICK:
+    ss << "iput-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IPUT_WIDE_QUICK:
+    ss << "iput-wide-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IPUT_OBJECT_QUICK:
+    ss << "iput-object-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_INVOKE_VIRTUAL_QUICK:
+    ss << "invoke-virtual-quick ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
+    return ss.str();
+  case DOPCODE_INVOKE_VIRTUAL_RANGE_QUICK:
+    ss << "invoke-virtual/range-quick ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
+    return ss.str();
+  case DOPCODE_IPUT_BOOLEAN_QUICK:
+    ss << "iput-boolean-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IPUT_BYTE_QUICK:
+    ss << "iput-byte-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IPUT_CHAR_QUICK:
+    ss << "iput-char-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IPUT_SHORT_QUICK:
+    ss << "iput-short-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IGET_BOOLEAN_QUICK:
+    ss << "iget-boolean-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IGET_BYTE_QUICK:
+    ss << "iget-byte-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IGET_CHAR_QUICK:
+    ss << "iget-char-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_IGET_SHORT_QUICK:
+    ss << "iget-short-quick ";
+    ss << show_field(static_cast<const DexOpcodeField*>(insn)->get_field(),
+                     deobfuscated);
+    return ss.str();
+  case DOPCODE_INVOKE_POLYMORPHIC:
+    ss << "invoke-polymorphic ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
+    return ss.str();
+  case DOPCODE_INVOKE_POLYMORPHIC_RANGE:
+    ss << "invoke-polymorphic/range ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
+    return ss.str();
+  case DOPCODE_INVOKE_CUSTOM:
+    ss << "invoke-custom ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
+    return ss.str();
+  case DOPCODE_INVOKE_CUSTOM_RANGE:
+    ss << "invoke-custom/range ";
+    ss << show_method(static_cast<const DexOpcodeMethod*>(insn)->get_method(),
+                      deobfuscated);
+    return ss.str();
+  case DOPCODE_CONST_METHOD_HANDLE:
+    ss << "const-method-handle ";
+    ss << show_methodhandle(
+        static_cast<const DexOpcodeMethodHandle*>(insn)->get_methodhandle(),
+        deobfuscated);
+    return ss.str();
+  case DOPCODE_CONST_METHOD_TYPE:
+    ss << "const-method-type ";
+    ss << show_proto(static_cast<const DexOpcodeProto*>(insn)->get_proto(),
+                     deobfuscated);
+    return ss.str();
   }
 }
 
-}
-
-std::string show(const DexString* p) {
-  if (!p) return "";
-  return std::string(p->m_cstr);
-}
-
-std::string show(const DexType* p) {
-  if (!p) return "";
-  return show(p->m_name);
-}
-
-std::string show(const DexField* p) {
-  if (!p) return "";
-  std::stringstream ss;
-  ss << accessibility(p->m_access) << humanize(show(p->m_type)) << " "
-     << humanize(show(p->m_class)) << "." << show(p->m_name);
-  if (p->m_anno) {
-    ss << "\n  annotations:" << show(p->m_anno);
+std::string show_insn(const IRInstruction* insn, bool deobfuscated) {
+  if (!insn) return "";
+  std::ostringstream ss;
+  ss << show(insn->opcode()) << " ";
+  bool first = true;
+  if (insn->has_dest()) {
+    ss << "v" << insn->dest();
+    first = false;
+  }
+  for (unsigned i = 0; i < insn->srcs_size(); ++i) {
+    if (!first) ss << ", ";
+    ss << "v" << insn->src(i);
+    first = false;
+  }
+  if (opcode::ref(insn->opcode()) != opcode::Ref::None && !first) {
+    ss << ", ";
+  }
+  switch (opcode::ref(insn->opcode())) {
+  case opcode::Ref::None:
+    break;
+  case opcode::Ref::String:
+    ss << boost::io::quoted(show(insn->get_string()));
+    break;
+  case opcode::Ref::Type:
+    ss << (deobfuscated ? show_deobfuscated(insn->get_type())
+                        : show(insn->get_type()));
+    break;
+  case opcode::Ref::Field:
+    if (deobfuscated) {
+      ss << show_deobfuscated(insn->get_field());
+    } else {
+      ss << show(insn->get_field());
+    }
+    break;
+  case opcode::Ref::Method:
+    if (deobfuscated) {
+      ss << show_deobfuscated(insn->get_method());
+    } else {
+      ss << show(insn->get_method());
+    }
+    break;
+  case opcode::Ref::Literal:
+    ss << insn->get_literal();
+    break;
+  case opcode::Ref::Data:
+    ss << "<data>"; // TODO: print something more informative
+    break;
+  case opcode::Ref::CallSite:
+    if (deobfuscated) {
+      ss << show_deobfuscated(insn->get_callsite());
+    } else {
+      ss << show(insn->get_callsite());
+    }
+    break;
+  case opcode::Ref::MethodHandle:
+    if (deobfuscated) {
+      ss << show_deobfuscated(insn->get_methodhandle());
+    } else {
+      ss << show(insn->get_methodhandle());
+    }
+    break;
+  case opcode::Ref::Proto:
+    ss << show_proto(insn->get_proto(), deobfuscated);
+    break;
   }
   return ss.str();
 }
 
-std::string show(const DexTypeList* p) {
-  if (!p) return "";
-  std::stringstream ss;
-  for (auto const type : p->m_list) {
-    ss << show(type);
+std::string show_helper(const DexAnnotation* anno, bool deobfuscated) {
+  if (!anno) {
+    return "";
+  }
+  std::ostringstream ss;
+  ss << "type:" << show(anno->type()) << " visibility:" << show(anno->viz())
+     << " annotations:";
+  if (deobfuscated) {
+    ss << show_deobfuscated(&anno->anno_elems());
+  } else {
+    ss << show(&anno->anno_elems());
   }
   return ss.str();
 }
 
-std::string show(const DexProto* p) {
+} // namespace
+
+std::ostream& operator<<(std::ostream& o, const DexString& str) {
+  o << str.c_str();
+  return o;
+}
+
+// This format must match the proguard map format because it's used to look up
+// in the proguard map
+std::ostream& operator<<(std::ostream& o, const DexType& type) {
+  o << *type.get_name();
+  return o;
+}
+
+inline std::string show(const DexString* p) {
   if (!p) return "";
-  std::stringstream ss;
-  ss << "(" << show(p->m_args) << ")" << show(p->m_rtype);
+  return p->str_copy();
+}
+
+inline std::string show(const DexType* t) { return show_type(t, false); }
+
+// This format must match the proguard map format because it's used to look up
+// in the proguard map
+std::string show(const DexFieldRef* ref) { return show_field(ref, false); }
+
+std::ostream& operator<<(std::ostream& o, const DexFieldRef& p) {
+  o << show(&p);
+  return o;
+}
+
+std::string vshow(const DexField* p) {
+  if (!p) return "";
+  std::ostringstream ss;
+  ss << accessibility(p->get_access()) << humanize(show(p->get_type())) << " "
+     << humanize(show(p->get_class())) << "." << show(p->get_name());
+  if (p->get_anno_set()) {
+    ss << "\n  annotations:" << show(p->get_anno_set());
+  }
   return ss.str();
 }
+
+std::string vshow(const DexTypeList* p) {
+  if (!p) return "";
+  std::ostringstream ss;
+  bool first = true;
+  for (auto const& type : *p) {
+    if (!first) {
+      ss << ", ";
+    } else {
+      first = false;
+    }
+    ss << humanize(show(type));
+  }
+  return ss.str();
+}
+
+std::string vshow(const DexProto* p, bool include_ret_type = true) {
+  if (!p) return "";
+  std::ostringstream ss;
+  ss << "(" << vshow(p->get_args()) << ")";
+  if (include_ret_type) {
+    ss << humanize(show(p->get_rtype()));
+  }
+  return ss.str();
+}
+
+// This format must match the proguard map format because it's used to look up
+// in the proguard map
+std::string show(const DexTypeList* l) { return show_type_list(l, false); }
+
+// This format must match the proguard map format because it's used to look up
+// in the proguard map
+std::string show(const DexProto* p) { return show_proto(p, false); }
 
 std::string show(const DexCode* code) {
   if (!code) return "";
-  std::stringstream ss;
-  ss << "regs: " << code->m_registers_size << ", ins: " << code->m_ins_size
-     << ", outs: " << code->m_outs_size << "\n";
-  for (auto insn : code->m_insns) {
-    ss << show(insn) << "\n";
-  }
-  return ss.str();
-}
-
-std::string show(const DexMethod* p) {
-  if (!p) return "";
-  std::stringstream ss;
-  ss << accessibility(p->m_access, true) << humanize(show(p->m_class)) << "."
-     << show(p->m_name) << show(p->m_proto);
-  if (p->m_anno) {
-    ss << "\n  annotations:" << show(p->m_anno);
-  }
-  bool first = true;
-  for (auto const pair : p->m_param_anno) {
-    if (first) {
-      ss << "\n  param annotations:"
-         << "\n";
-      first = false;
+  std::ostringstream ss;
+  ss << "regs: " << code->get_registers_size()
+     << ", ins: " << code->get_ins_size() << ", outs: " << code->get_outs_size()
+     << "\n";
+  if (code->m_insns) {
+    for (auto const& insn : code->get_instructions()) {
+      ss << show(insn) << "\n";
     }
-    ss << "    " << pair.first << ": " << show(pair.second) << "\n";
   }
   return ss.str();
 }
 
-std::string show(const DexClass* p) {
+// This format must match the proguard map format because it's used to look up
+// in the proguard map
+std::string show(const DexMethodRef* ref) { return show_method(ref, false); }
+
+std::string vshow(uint32_t acc, bool is_method) {
+  return accessibility(acc, is_method);
+}
+
+std::string vshow(const DexType* t) { return humanize(show(t)); }
+
+std::string vshow(const DexMethod* p, bool include_annotations /*=true*/) {
   if (!p) return "";
-  std::stringstream ss;
-  ss << accessibility(p->get_access()) << humanize(show(p->m_self))
-     << " extends " << humanize(show(p->m_super_class));
-  if (p->m_interfaces) {
+  std::ostringstream ss;
+  ss << (p->is_def() ? accessibility(p->get_access(), true)
+                     : std::string("(?)"))
+     << vshow(p->get_proto()->get_rtype()) << " "
+     << humanize(show(p->get_class())) << "." << show(p->get_name())
+     << vshow(p->get_proto(), false);
+  if (include_annotations) {
+    if (p->get_anno_set()) {
+      ss << "\n  annotations:" << show(p->get_anno_set());
+    }
+    bool first = true;
+    if (p->get_param_anno() != nullptr) {
+      for (auto const& pair : *p->get_param_anno()) {
+        if (first) {
+          ss << "\n  param annotations:"
+             << "\n";
+          first = false;
+        }
+        ss << "    " << pair.first << ": " << show(pair.second) << "\n";
+      }
+    }
+  }
+  return ss.str();
+}
+
+// This format must match the proguard map format because it's used to look up
+// in the proguard map
+std::ostream& operator<<(std::ostream& o, const DexClass& cls) {
+  o << *cls.get_type();
+  return o;
+}
+
+std::string vshow(const DexClass* p) {
+  if (!p) return "";
+  std::ostringstream ss;
+  ss << accessibility(p->get_access()) << humanize(show(p->get_type()))
+     << " extends " << humanize(show(p->get_super_class()));
+  if (p->get_interfaces()) {
     ss << " implements ";
     bool first = true;
-    for (auto const type : p->m_interfaces->get_type_list()) {
+    for (auto const type : *p->get_interfaces()) {
       if (first)
         first = false;
       else
@@ -702,8 +1144,8 @@ std::string show(const DexClass* p) {
       ss << humanize(show(type));
     }
   }
-  if (p->m_anno) {
-    ss << "\n  annotations:" << show(p->m_anno);
+  if (p->get_anno_set()) {
+    ss << "\n  annotations:" << show(p->get_anno_set());
   }
   return ss.str();
 }
@@ -713,59 +1155,19 @@ std::string show(const DexEncodedValue* value) {
   return value->show();
 }
 
-std::string DexEncodedValue::show() const {
-  std::stringstream ss;
-  ss << m_value;
-  return ss.str();
-}
+std::string show(const DexAnnotation* anno) { return show_helper(anno, false); }
 
-std::string DexEncodedValueArray::show() const {
-  std::stringstream ss;
-  ss << (m_static_val ? "(static) " : "");
-  if (m_evalues) {
-    bool first = true;
-    for (auto const evalue : *m_evalues) {
-      if (!first) ss << ' ';
-      ss << evalue->show();
-      first = false;
-    }
-  }
-  return ss.str();
-}
-
-std::string DexEncodedValueAnnotation::show() const {
-  std::stringstream ss;
-  ss << "type:" << ::show(m_type) << " annotations:" << ::show(m_annotations);
-  return ss.str();
-}
-
-std::string show(const EncodedAnnotations* annos) {
-  if (!annos) return "";
-  std::stringstream ss;
-  bool first = true;
-  for (auto const pair : *annos) {
-    if (!first) ss << ", ";
-    ss << show(pair.string) << ":" << pair.encoded_value->show();
-    first = false;
-  }
-  return ss.str();
-}
-
-std::string show(const DexAnnotation* p) {
-  if (!p) return "";
-  std::stringstream ss;
-  ss << "type:" << show(p->m_type) << " visibility:" << show(p->m_viz)
-     << " annotations:" << show(&p->m_anno_elems);
-  return ss.str();
+std::string show_deobfuscated(const DexAnnotation* anno) {
+  return show_helper(anno, true);
 }
 
 std::string show(const DexAnnotationSet* p) {
   if (!p) return "";
-  std::stringstream ss;
+  std::ostringstream ss;
   bool first = true;
-  for (auto const anno : p->m_annotations) {
+  for (auto const& anno : p->get_annotations()) {
     if (!first) ss << ", ";
-    ss << show(anno);
+    ss << show(anno.get());
     first = false;
   }
   return ss.str();
@@ -773,27 +1175,27 @@ std::string show(const DexAnnotationSet* p) {
 
 std::string show(const DexAnnotationDirectory* p) {
   if (!p) return "";
-  std::stringstream ss;
+  std::ostringstream ss;
   if (p->m_class) {
     ss << "class annotations:\n" << show(p->m_class) << "\n";
   }
   if (p->m_field) {
     ss << "field annotations:\n";
-    for (auto const pair : *p->m_field) {
+    for (auto const& pair : *p->m_field) {
       ss << show(pair.first->get_name()) << ": " << show(pair.second) << "\n";
     }
   }
   if (p->m_method) {
     ss << "method annotations:\n";
-    for (auto const pair : *p->m_method) {
+    for (auto const& pair : *p->m_method) {
       ss << show(pair.first->get_name()) << ": " << show(pair.second) << "\n";
     }
   }
   if (p->m_method_param) {
     ss << "method parameter annotations:\n";
-    for (auto const pair : *p->m_method_param) {
+    for (auto const& pair : *p->m_method_param) {
       ss << show(pair.first->get_name());
-      for (auto const parampair : *pair.second) {
+      for (auto const& parampair : *pair.second) {
         ss << "  " << parampair.first << ": " << show(parampair.second) << "\n";
       }
     }
@@ -801,70 +1203,186 @@ std::string show(const DexAnnotationDirectory* p) {
   return ss.str();
 }
 
-std::string show(DexCodeItemOpcode opcode) {
+std::string show(IROpcode opcode) {
   switch (opcode) {
 #define OP(op, ...) \
   case OPCODE_##op: \
     return #op;
-    OPS
+#define IOP(op, ...) \
+  case IOPCODE_##op: \
+    return "IOPCODE_" #op;
+#define OPRANGE(...)
+#include "IROpcodes.def"
+  }
+  not_reached_log("Unknown opcode 0x%x", opcode);
+}
+
+std::string show(DexOpcode opcode) {
+  switch (opcode) {
+#define OP(op, ...)  \
+  case DOPCODE_##op: \
+    return #op;
+    DOPS
 #undef OP
         case FOPCODE_PACKED_SWITCH : return "PACKED_SWITCH_DATA";
   case FOPCODE_SPARSE_SWITCH:
     return "SPARSE_SWITCH_DATA";
   case FOPCODE_FILLED_ARRAY:
     return "FILLED_ARRAY_DATA";
+    SWITCH_FORMAT_QUICK_FIELD_REF
+    SWITCH_FORMAT_QUICK_METHOD_REF
+    SWITCH_FORMAT_RETURN_VOID_NO_BARRIER { not_reached(); }
   }
-  always_assert_log(false, "Unknown opcode");
-  return "";
 }
 
-std::string show(const DexOpcode* op) {
-  if (!op) return "";
-  std::stringstream ss;
-  ss << show_opcode(op);
+// Read n_bytes bytes from data into an integral value of type
+// IntType while also incrementing the data pointer by n_bytes bytes.
+// n_bytes should be less than sizeof(IntType)
+template <typename IntType>
+static IntType read(const uint8_t*& data, uint16_t n_bytes) {
+  static_assert(std::is_integral<IntType>::value,
+                "Only read into integral values.");
+  always_assert_log(sizeof(IntType) >= n_bytes,
+                    "Should not read more bytes than sizeof(IntType)");
+  IntType result = 0;
+  memcpy(&result, data, n_bytes);
+  data += n_bytes;
+  return result;
+}
+
+std::string show(const DexOpcodeData* insn) {
+  if (!insn) return "";
+  std::ostringstream ss;
+  ss << "{ ";
+  const auto* data = insn->data();
+  switch (insn->opcode()) {
+  case FOPCODE_SPARSE_SWITCH: {
+    // See format at
+    // https://source.android.com/devices/tech/dalvik/dalvik-bytecode#sparse-switch
+    const uint16_t entries = *data++;
+    const uint16_t* tdata = data + 2 * entries;
+
+    const uint8_t* data_ptr = (uint8_t*)data;
+    const uint8_t* tdata_ptr = (uint8_t*)tdata;
+    for (size_t i = 0; i < entries; i++) {
+      if (i != 0) {
+        ss << ", ";
+      }
+      int32_t case_key = read<int32_t>(data_ptr, sizeof(int32_t));
+      uint32_t target_offset = read<uint32_t>(tdata_ptr, sizeof(uint32_t));
+      ss << case_key << "->" << target_offset;
+    }
+    break;
+  }
+  case FOPCODE_PACKED_SWITCH: {
+    // See format at
+    // https://source.android.com/devices/tech/dalvik/dalvik-bytecode#packed-switch
+    const uint16_t entries = *data++;
+    const uint8_t* data_ptr = (uint8_t*)data;
+    int32_t case_key = read<int32_t>(data_ptr, sizeof(int32_t));
+    for (size_t i = 0; i < entries; i++) {
+      if (i != 0) {
+        ss << ", ";
+      }
+      uint32_t target_offset = read<uint32_t>(data_ptr, sizeof(uint32_t));
+      ss << case_key++ << "->" << target_offset;
+    }
+    break;
+  }
+  case FOPCODE_FILLED_ARRAY: {
+    // See format at
+    // https://source.android.com/devices/tech/dalvik/dalvik-bytecode#fill-array
+    const uint16_t ewidth = *data++;
+    const uint32_t size = *((uint32_t*)data);
+    ss << "[" << size << " x " << ewidth << "] ";
+    // escape size
+    data += 2;
+    const uint8_t* data_ptr = (uint8_t*)data;
+    ss << "{ ";
+    for (size_t i = 0; i < size; i++) {
+      if (i != 0) {
+        ss << ", ";
+      }
+      ss << std::hex << read<uint64_t>(data_ptr, ewidth);
+    }
+    ss << " }";
+    break;
+  }
+  default:
+    // should not get here
+    ss << "unknown_payload";
+    break;
+  }
+  ss << " }";
+  return ss.str();
+}
+
+std::string show_insn(const DexInstruction* insn, bool deobfuscated) {
+  if (!insn) return "";
+  std::ostringstream ss;
+  ss << show_opcode(insn, deobfuscated);
+  if (dex_opcode::is_fopcode(insn->opcode())) {
+    ss << " " << show(static_cast<const DexOpcodeData*>(insn));
+    return ss.str();
+  }
+
   bool first = true;
-  if (op->dests_size()) {
-    ss << " v" << op->dest();
+  if (insn->has_dest()) {
+    ss << " v" << insn->dest();
     first = false;
   }
-  for (unsigned i = 0; i < op->srcs_size(); ++i) {
+  for (unsigned i = 0; i < insn->srcs_size(); ++i) {
     if (!first) ss << ",";
-    ss << " v" << op->src(i);
+    ss << " v" << insn->src(i);
+    first = false;
+  }
+  if (dex_opcode::has_literal(insn->opcode())) {
+    if (!first) ss << ",";
+    ss << " " << insn->get_literal();
     first = false;
   }
   return ss.str();
 }
 
-std::string show(const DexDebugOpcode* op) {
-  if (!op) return "";
-  std::stringstream ss;
-  switch (op->opcode()) {
+std::string show(const IRInstruction* insn) { return show_insn(insn, false); }
+
+std::string show(const DexInstruction* insn) { return show_insn(insn, false); }
+
+std::ostream& operator<<(std::ostream& o, const IRInstruction& insn) {
+  o << show(&insn);
+  return o;
+}
+
+std::string show(const DexDebugInstruction* insn) {
+  if (!insn) return "";
+  std::ostringstream ss;
+  switch (insn->opcode()) {
   case DBG_END_SEQUENCE:
     ss << "DBG_END_SEQUENCE";
     break;
   case DBG_ADVANCE_PC:
-    ss << "DBG_ADVANCE_PC " << op->uvalue();
+    ss << "DBG_ADVANCE_PC " << insn->uvalue();
     break;
   case DBG_ADVANCE_LINE:
-    ss << "DBG_ADVANCE_LINE " << op->value();
+    ss << "DBG_ADVANCE_LINE " << insn->value();
     break;
   case DBG_START_LOCAL: {
-    auto sl = static_cast<const DexDebugOpcodeStartLocal*>(op);
-    ss << "DBG_START_LOCAL v" << sl->uvalue() << " " << show(sl->name())
-        << ":" << show(sl->type());
+    auto sl = static_cast<const DexDebugOpcodeStartLocal*>(insn);
+    ss << "DBG_START_LOCAL v" << sl->uvalue() << " " << show(sl->name()) << ":"
+       << show(sl->type());
     break;
   }
   case DBG_START_LOCAL_EXTENDED: {
-    auto sl = static_cast<const DexDebugOpcodeStartLocal*>(op);
-    ss << "DBG_START_LOCAL v" << sl->uvalue() << " " << show(sl->name())
-        << ":" << show(sl->type()) << ";" << show(sl->sig());
+    auto sl = static_cast<const DexDebugOpcodeStartLocal*>(insn);
+    ss << "DBG_START_LOCAL v" << sl->uvalue() << " " << show(sl->name()) << ":"
+       << show(sl->type()) << ";" << show(sl->sig());
     break;
   }
   case DBG_END_LOCAL:
-    ss << "DBG_END_LOCAL v" << op->uvalue();
+    ss << "DBG_END_LOCAL v" << insn->uvalue();
     break;
   case DBG_RESTART_LOCAL:
-    ss << "DBG_RESTART_LOCAL v" << op->uvalue();
+    ss << "DBG_RESTART_LOCAL v" << insn->uvalue();
     break;
   case DBG_SET_PROLOGUE_END:
     ss << "DBG_SET_PROLOGUE_END";
@@ -873,19 +1391,49 @@ std::string show(const DexDebugOpcode* op) {
     ss << "DBG_SET_EPILOGUE_BEGIN";
     break;
   case DBG_SET_FILE: {
-    auto sf = static_cast<const DexDebugOpcodeSetFile*>(op);
+    auto sf = static_cast<const DexDebugOpcodeSetFile*>(insn);
     ss << "DBG_SET_FILE " << show(sf->file());
     break;
   }
   default: {
-    constexpr int DBG_FIRST_SPECIAL = 0x0a;
-    constexpr int DBG_LINE_BASE = -4;
-    constexpr int DBG_LINE_RANGE = 15;
-    auto adjusted_opcode = op->opcode() - DBG_FIRST_SPECIAL;
+    auto adjusted_opcode = insn->opcode() - DBG_FIRST_SPECIAL;
     auto line = DBG_LINE_BASE + (adjusted_opcode % DBG_LINE_RANGE);
     auto address = (adjusted_opcode / DBG_LINE_RANGE);
     ss << "DBG_SPECIAL line+=" << line << " addr+=" << address;
   }
+  }
+  return ss.str();
+}
+
+std::ostream& operator<<(std::ostream& o, const DexPosition& pos) {
+  if (pos.method != nullptr) {
+    o << *pos.method;
+  } else {
+    o << "Unknown method";
+  }
+  o << "(";
+  if (pos.file == nullptr) {
+    o << "Unknown source";
+  } else {
+    o << *pos.file;
+  }
+  o << ":" << pos.line << ")";
+  if (pos.parent != nullptr) {
+    o << " [parent: " << pos.parent << "]";
+  }
+  return o;
+}
+
+std::string show(const DexDebugEntry* entry) {
+  std::ostringstream ss;
+  ss << std::hex;
+  switch (entry->type) {
+  case DexDebugEntryType::Instruction:
+    ss << "INSTRUCTION: [0x" << entry->addr << "] " << show(entry->insn);
+    break;
+  case DexDebugEntryType::Position:
+    ss << "POSITION: [0x" << entry->addr << "] " << show(entry->pos);
+    break;
   }
   return ss.str();
 }
@@ -896,72 +1444,112 @@ std::string show(TryEntryType t) {
     return "TRY_START";
   case TRY_END:
     return "TRY_END";
-  case TRY_CATCH:
-    return "TRY_CATCH";
   }
-  not_reached();
 }
 
-std::string show(const MethodItemEntry& mei) {
-  std::stringstream ss;
-  switch (mei.type) {
+std::string show(const SwitchIndices& si) {
+  std::ostringstream ss;
+  for (auto index : si) {
+    ss << index << " ";
+  }
+  return ss.str();
+}
+
+std::ostream& operator<<(std::ostream& o, const MethodItemEntry& mie) {
+  o << "[" << &mie << "] ";
+  switch (mie.type) {
   case MFLOW_OPCODE:
-    ss << "OPCODE: [" << mei.op << "] " << show(mei.op);
-    return ss.str();
+    o << "OPCODE: " << show(mie.insn);
+    break;
+  case MFLOW_DEX_OPCODE:
+    o << "DEX_OPCODE: " << show(mie.dex_insn);
+    break;
   case MFLOW_TARGET:
-    if (mei.target->type == BRANCH_MULTI) {
-      ss << "TARGET MULTI: " << mei.target->src->op;
+    if (mie.target->type == BRANCH_MULTI) {
+      o << "TARGET: MULTI " << mie.target->case_key << " ";
     } else {
-      ss << "TARGET SIMPLE: " << mei.target->src->op;
+      o << "TARGET: SIMPLE ";
     }
-    return ss.str();
+    o << mie.target->src;
+    break;
   case MFLOW_TRY:
-    ss << "TRY: " << show(mei.tentry->type);
-    return ss.str();
+    o << "TRY: " << show(mie.tentry->type) << " " << mie.tentry->catch_start;
+    break;
+  case MFLOW_CATCH:
+    o << "CATCH: " << show(mie.centry->catch_type);
+    if (mie.centry->next != nullptr) {
+      o << " (next " << mie.centry->next << ")";
+    }
+    break;
   case MFLOW_DEBUG:
-    ss << "DEBUG: " << show(mei.dbgop);
-    return ss.str();
+    o << "DEBUG: " << show(mie.dbgop);
+    break;
+  case MFLOW_POSITION:
+    o << "POSITION: " << *mie.pos;
+    break;
+  case MFLOW_SOURCE_BLOCK:
+    o << "SOURCE-BLOCKS: " << mie.src_block->show();
+    break;
   case MFLOW_FALLTHROUGH:
-    return "FALLTHROUGH:";
+    o << "FALLTHROUGH";
+    break;
   }
-  not_reached();
+  return o;
 }
 
-std::string show(const FatMethod* fm) {
+std::ostream& operator<<(std::ostream& o, const DexMethodHandle& mh) {
+  o << "[" << &mh << "] ";
+  o << "METHODHANDLE: TYPE=" << show(mh.type());
+  o << " FIELD_OR_METHOD_ID=";
+  if (DexMethodHandle::isInvokeType(mh.type())) {
+    o << show(mh.methodref());
+  } else {
+    o << show(mh.fieldref());
+  }
+  return o;
+}
+
+std::ostream& operator<<(std::ostream& o, const DexCallSite& cs) {
+  o << "[" << &cs << "] ";
+  o << "CALLSITE: METHODHANDLE=" << show(cs.method_handle());
+  o << " METHODNAME=" << show(cs.method_name());
+  o << " METHODTYPE=" << show(cs.method_type());
+  return o;
+}
+
+std::string show(const IRList* ir) {
   std::string ret;
-  for (auto const& mei : *fm) {
+  for (auto const& mei : *ir) {
     ret += show(mei);
     ret += "\n";
   }
   return ret;
 }
 
-std::string show(const std::vector<Block*>& blocks) {
-  std::stringstream ss;
-  ss << "CFG:\n";
-  for (auto& b : blocks) {
-    ss << "B" << b->m_id << " succs:";
-    for (auto& s : b->m_succs) {
-      ss << " B" << s->m_id;
-    }
-    ss << " preds:";
-    for (auto& p : b->m_preds) {
-      ss << " B" << p->m_id;
-    }
-    ss << "\n";
-  }
-  for (auto const& b : blocks) {
-    ss << "  Block B" << b->m_id << ":\n";
-    for (auto const& mei : *b) {
-      ss << "    " << show(mei) << "\n";
-    }
-  }
-  return ss.str();
+namespace {
+
+struct NoneSpecial {
+  void mie_before(std::ostream&, const MethodItemEntry&) {}
+  void mie_after(std::ostream&, const MethodItemEntry&) {}
+  void start_block(std::ostream&, const cfg::Block*) {}
+  void end_block(std::ostream&, const cfg::Block*) {}
+};
+
+} // namespace
+
+std::string show(const cfg::Block* block) {
+  NoneSpecial nothing{};
+  return show(block, nothing);
+}
+
+std::string show(const cfg::ControlFlowGraph& cfg) {
+  NoneSpecial nothing{};
+  return show(cfg, nothing);
 }
 
 std::string show(const MethodCreator* mc) {
   if (!mc) return "";
-  std::stringstream ss;
+  std::ostringstream ss;
   ss << "MethodCode for " << SHOW(mc->method) << "\n";
   ss << "locals: ";
   for (auto& loc : mc->locals) {
@@ -974,12 +1562,12 @@ std::string show(const MethodCreator* mc) {
 
 std::string show(const MethodBlock* block) {
   if (!block) return "";
-  std::stringstream ss;
+  std::ostringstream ss;
   return ss.str();
 }
 
 std::string show(DexIdx* p) {
-  std::stringstream ss;
+  std::ostringstream ss;
   ss << "----------------------------------------\n"
      << "strings\n"
      << "----------------------------------------\n";
@@ -1007,3 +1595,119 @@ std::string show(DexIdx* p) {
   return ss.str();
 }
 
+std::string show(const IRCode* mt) { return show(mt->m_ir_list); }
+
+std::string show(const ir_list::InstructionIterable& it) {
+  std::ostringstream ss;
+  for (auto& mei : it) {
+    ss << show(mei.insn) << "\n";
+  }
+  return ss.str();
+}
+
+std::string show_context(IRCode const* code, IRInstruction const* insn) {
+  std::ostringstream ss;
+  auto iter = code->begin();
+  while ((*iter).insn != insn) {
+    always_assert(iter != code->end());
+    iter++;
+  }
+  for (int i = 0; i < 6 && iter != code->begin(); i++) {
+    iter--;
+  }
+  for (int i = 0; i < 11 && iter != code->end(); i++) {
+    ss << SHOW(*iter++) << std::endl;
+  }
+  return ss.str();
+}
+
+std::string show_deobfuscated(const DexClass* cls) {
+  if (!cls) {
+    return "";
+  }
+  const auto& deob = cls->get_deobfuscated_name_or_empty();
+  if (!deob.empty()) {
+    return str_copy(deob);
+  }
+  return cls->get_name() ? cls->get_name()->str_copy() : show(cls);
+}
+
+std::string show_deobfuscated(const DexFieldRef* ref) {
+  return show_field(ref, true);
+}
+
+std::string show_deobfuscated(const DexMethodRef* ref) {
+  return show_method(ref, true);
+}
+
+std::string show_deobfuscated(const IRInstruction* insn) {
+  return show_insn(insn, true);
+}
+
+std::string show_deobfuscated(const DexInstruction* insn) {
+  return show_insn(insn, true);
+}
+
+std::string show_deobfuscated(const DexEncodedValue* ev) {
+  if (ev == nullptr) {
+    return "";
+  }
+  return ev->show_deobfuscated();
+}
+
+std::string show_deobfuscated(const DexType* t) { return show_type(t, true); }
+
+std::string show_deobfuscated(const DexTypeList* l) {
+  return show_type_list(l, true);
+}
+
+std::string show_deobfuscated(const DexProto* p) { return show_proto(p, true); }
+
+std::string show_deobfuscated(const DexCallSite* callsite) {
+  if (!callsite) {
+    return "";
+  }
+  // TODO(T58570881) - actually deobfuscate
+  return SHOW(callsite);
+}
+
+std::string show_deobfuscated(const DexMethodHandle* methodhandle) {
+  if (!methodhandle) {
+    return "";
+  }
+  // TODO(T58570881) - actually deobfuscate
+  return SHOW(methodhandle);
+}
+
+std::string pretty_bytes(uint64_t val) {
+  size_t divisions = 0;
+  double d_val = val;
+  while (d_val > 1024 && divisions < 3) {
+    d_val /= 1024;
+    ++divisions;
+  }
+
+  const char* modifier;
+  switch (divisions) {
+  case 0:
+    modifier = "";
+    break;
+  case 1:
+    modifier = "k";
+    break;
+  case 2:
+    modifier = "M";
+    break;
+  case 3:
+    modifier = "G";
+    break;
+  default:
+    modifier = "Error";
+    break;
+  }
+
+  std::ostringstream oss;
+  oss << std::setiosflags(std::ios::fixed) << std::setprecision(2) << d_val
+      << " " << modifier << "B";
+  return oss.str();
+}

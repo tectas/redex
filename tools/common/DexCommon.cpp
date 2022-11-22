@@ -1,22 +1,23 @@
-/**
- * Copyright (c) 2016-present, Facebook, Inc.
- * All rights reserved.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #include "DexCommon.h"
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
-static const char* dex_header_string = "dex\n035";
+static const char* dex_v35_header_string = "dex\n035";
+static const char* dex_v37_header_string = "dex\n037";
+static const char* dex_v38_header_string = "dex\n038";
+static const char* dex_v39_header_string = "dex\n039";
 
 void get_dex_map_items(ddump_data* rd,
                        unsigned int* _count,
@@ -64,7 +65,14 @@ void open_dex_file(const char* filename, ddump_data* rd) {
     exit(1);
   }
   rd->dexh = (dex_header*)rd->dexmmap;
-  if (memcmp(rd->dexh->magic, dex_header_string, sizeof(rd->dexh->magic))) {
+  if (memcmp(rd->dexh->magic, dex_v35_header_string, sizeof(rd->dexh->magic)) !=
+          0 &&
+      memcmp(rd->dexh->magic, dex_v37_header_string, sizeof(rd->dexh->magic)) !=
+          0 &&
+      memcmp(rd->dexh->magic, dex_v38_header_string, sizeof(rd->dexh->magic)) !=
+          0 &&
+      memcmp(rd->dexh->magic, dex_v39_header_string, sizeof(rd->dexh->magic)) !=
+          0) {
     fprintf(stderr, "Bad dex magic, bailing\n");
     exit(1);
   }
